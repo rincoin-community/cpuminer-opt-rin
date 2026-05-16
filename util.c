@@ -2145,6 +2145,24 @@ static bool stratum_set_difficulty(struct stratum_ctx *sctx, json_t *params)
 
 	pthread_mutex_lock(&sctx->work_lock);
 	sctx->next_diff = diff;
+	/*
+	 * BUG FIX: Apply difficulty change immediately to current job
+	 * 
+	 * Some pools (e.g., Rincoin pools) send difficulty changes without
+	 * accompanying job notifications. Without this fix, the miner would
+	 * continue mining at the old difficulty until the next job, potentially
+	 * submitting shares that the pool rejects as too easy.
+	 *
+	 * However, some pools send mining.set_difficulty before the first
+	 * mining.notify. In that case we must not force a work rebuild yet,
+	 * because the job fields are still incomplete and generating work from
+	 * them can crash the miner on startup.
+	 */
+	sctx->job.diff = diff;
+	if (sctx->job.job_id)
+		sctx->new_job = true;  /* Signal work regeneration with new target */
+	else if (opt_debug)
+		applog(LOG_DEBUG, "Stratum difficulty %g received before first job", diff);
 	pthread_mutex_unlock(&sctx->work_lock);
 	return true;
 }
