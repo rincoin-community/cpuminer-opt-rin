@@ -9,10 +9,6 @@ name: Release
 
 on:
   workflow_dispatch:
-  # TEMPORARY while the workflow is being developed: build and test on every
-  # push to the scratch branch, without creating a release.
-  push:
-    branches: [ ci/release-workflow ]
 
 permissions:
   contents: write
@@ -160,7 +156,6 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.event_name == 'workflow_dispatch'
     needs: [ linux-x86_64, linux-arm64, macos-arm64, windows-x86_64 ]
     runs-on: ubuntu-22.04
     steps:

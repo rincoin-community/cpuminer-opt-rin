@@ -62,4 +62,5 @@ compat/curl-for-windows/
 !/test/*.sh
 .dirstamp
 /build-multiarch/
+/.worktree/
 /dist/
