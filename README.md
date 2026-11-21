@@ -33,6 +33,31 @@ reading.
 See file RELEASE_NOTES for change log and INSTALL_LINUX or INSTALL_WINDOWS
 for compile instructions.
 
+Release builds of this fork
+---------------------------
+
+This fork adds the RinHash algorithm (Rincoin). Its releases contain one
+binary per system:
+
+    Linux x86-64, Windows x86-64    every CPU from SSE2 to AVX-512
+    Linux ARM64                     ARMv8-A with NEON
+    macOS ARM64                     Apple M1 and newer
+
+The x86-64 binary holds the whole miner four times, compiled for SSE2, SSE4.2,
+AVX2 and AVX-512, and uses the best version the CPU supports. The first line
+it prints says which one. Setting the environment variable CPUMINER_LEVEL to
+1, 2, 3 or 4 selects a lower one.
+
+build-multiarch.sh builds that binary; it needs gcc 12 or newer. The release
+workflow, .github/workflows/release.yml, is started by hand on GitHub and
+collects all four builds in a draft release.
+
+A build for the machine it runs on is still the fastest for algorithms that
+use AES or SHA instructions: ./build.sh.
+
+test/rinhash_bench.c verifies RinHash against the public BLAKE3 and Argon2
+code and measures it, see test/build_rinhash_bench.sh.
+
 Requirements
 ------------
 

@@ -33,6 +33,14 @@ CXX=${CXX:-g++}
 CONFIGURE_ARGS=${CONFIGURE_ARGS:---with-curl}
 BASE_CFLAGS=${BASE_CFLAGS:--O3 -Wall}
 
+# MinGW reaches variables of other objects through per-object pointer stubs
+# (.refptr.<name>) unless told that everything is within 2 GiB. The stubs
+# are merged by section name, which would join the four copies of the
+# algorithm code. The small code model does without them.
+case "$("$CC" -dumpmachine)" in
+   *mingw*) BASE_CFLAGS="$BASE_CFLAGS -mcmodel=small" ;;
+esac
+
 LEVEL_FLAGS=( "" "-march=x86-64" "-march=x86-64-v2" "-march=x86-64-v3 -maes"
               "-march=x86-64-v4 -maes" )
 
@@ -63,6 +71,10 @@ for L in 1 2 3 4; do
    ( cd "$B" && xargs nm -g --defined-only --format=posix < "$OUT/l$L.objects" ) \
       | awk -v p="ml${L}_" 'NF >= 2 && $1 !~ /:$/ { print $1, p $1 }' \
       | sort -u > "$OUT/l$L.symbols"
+   if grep -q '^\.refptr\.' "$OUT/l$L.symbols"; then
+      echo "level $L: the objects contain .refptr stubs, see the note on MinGW above" >&2
+      exit 1
+   fi
    rm -rf "$OUT/l$L.renamed" "$OUT/libalgo_l$L.a"
    mkdir -p "$OUT/l$L.renamed"
    while read -r obj; do
