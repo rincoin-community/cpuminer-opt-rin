@@ -971,7 +971,7 @@ Options:\n\
       --max-temp=N      only mine if cpu temp is less than specified value (linux)\n\
       --max-rate=N[KMG] only mine if net hashrate is less than specified value\n\
       --max-diff=N      only mine if net difficulty is less than specified value\n\
-      --mweb            enable MWEB support\n\
+      --mweb            no effect, the MWEB rule is always requested in solo mode\n\
   -c, --config=FILE     load a JSON-format configuration file\n\
       --data-file=FILE  path and name of data file\n\
       --verify          enable additional time consuming start up tests\n\

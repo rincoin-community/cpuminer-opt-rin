@@ -636,8 +636,9 @@ json_t *json_rpc_call(CURL *curl, const char *url,
 	rc = curl_easy_perform(curl);
 	if (curl_err != NULL)
 		*curl_err = rc;
+	http_rc = 0;
+	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_rc);
 	if (rc) {
-		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_rc);
 		if (!((flags & JSON_RPC_LONGPOLL) && rc == CURLE_OPERATION_TIMEDOUT) &&
 		    !((flags & JSON_RPC_QUIET_404) && http_rc == 404))
 			applog(LOG_ERR, "HTTP request failed: %s", curl_err_str);
@@ -692,32 +693,36 @@ json_t *json_rpc_call(CURL *curl, const char *url,
 		&& !(flags & JSON_RPC_IGNOREERR))) {
 
 		char *s = NULL;
+		long code = 0;
 
 		if (err_val) {
 			s = json_dumps(err_val, 0);
 			json_t *msg = json_object_get(err_val, "message");
 			json_t *err_code = json_object_get(err_val, "code");
-			if (curl_err && json_integer_value(err_code))
-				*curl_err = (int)json_integer_value(err_code);
+			code = (long)json_integer_value(err_code);
+			if (curl_err && code)
+				*curl_err = (int)code;
 
 			if (msg && json_is_string(msg)) {
 				free(s);
 				s = strdup(json_string_value(msg));
 				if (have_longpoll && s && !strcmp(s, "method not getwork")) {
-					json_decref(err_val);
+					json_decref(val);
 					free(s);
 					goto err_out;
 				}
 			}
-			json_decref(err_val);
 		}
 		else
 			s = strdup("(unknown reason)");
 
-		if (!curl_err || opt_debug)
-			applog(LOG_ERR, "JSON-RPC call failed: %s", s);
+		// Show the node's reason, e.g. a getblocktemplate refusal. Only the
+		// method-not-found probe of the getwork fallback stays quiet.
+		if (!((flags & JSON_RPC_QUIET_404) && http_rc == 404) || opt_debug)
+			applog(LOG_ERR, "JSON-RPC call failed: %s (code %ld)", s, code);
 
 		free(s);
+		json_decref(val);
 
 		goto err_out;
 	}

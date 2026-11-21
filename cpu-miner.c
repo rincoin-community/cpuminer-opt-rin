@@ -138,7 +138,7 @@ int opt_param_n = 0;
 int opt_param_r = 0;
 int opt_n_threads = 0;
 bool opt_sapling = false;
-bool opt_mweb = false;     // add mweb option definition
+bool opt_mweb = false;     // --mweb, no effect: the mweb rule is always requested
 static uint64_t opt_affinity = 0xFFFFFFFFFFFFFFFFULL;  // default, use all cores
 int opt_priority = 0;  // deprecated
 int num_cpus = 1;
@@ -553,6 +553,8 @@ static bool gbt_work_decode( const json_t *val, struct work *work )
    bool rc = false;
    int i, n;
    bool segwit = false;
+   const char *mweb_hex = NULL;
+   int mweb_size = 0;
 
    tmp = json_object_get( val, "rules" );
    if ( tmp && json_is_array( tmp ) )
@@ -675,6 +677,24 @@ static bool gbt_work_decode( const json_t *val, struct work *work )
          goto out;
       }
       tx_size += (int) ( strlen( tx_hex ) / 2 );
+   }
+
+   /* MWEB extension block. While MWEB is active the last template transaction
+      is the HogEx and the block must carry the MWEB block after the
+      transactions: 0x01 (present) followed by the template's "mweb" data. */
+   tmp = json_object_get( val, "mweb" );
+   if ( tmp )
+   {
+      mweb_hex = json_string_value( tmp );
+      mweb_size = mweb_hex ? (int) strlen( mweb_hex ) : 0;
+      if ( !mweb_size || ( mweb_size & 1 ) )
+      {
+         applog( LOG_ERR, "JSON invalid mweb" );
+         goto out;
+      }
+      mweb_size /= 2;
+      if ( opt_debug )
+         applog( LOG_INFO, "GBT: MWEB block, %d bytes", mweb_size );
    }
 
    /* build coinbase transaction */
@@ -838,7 +858,8 @@ static bool gbt_work_decode( const json_t *val, struct work *work )
    }
 
    n = varint_encode( txc_vi, 1 + tx_count );
-   work->txs = (char*) malloc( 2 * ( n + cbtx_size + tx_size ) + 1 );
+   work->txs = (char*) malloc( 2 * ( n + cbtx_size + tx_size
+                                     + ( mweb_hex ? 1 + mweb_size : 0 ) ) + 1 );
    bin2hex( work->txs, txc_vi, n );
    bin2hex( work->txs + 2*n, cbtx, cbtx_size );
 
@@ -876,6 +897,11 @@ static bool gbt_work_decode( const json_t *val, struct work *work )
 
       if ( !submit_coinbase )
          strcat( work->txs, tx_hex );
+   }
+   if ( mweb_hex && !submit_coinbase )
+   {
+      strcat( work->txs, "01" );
+      strcat( work->txs, mweb_hex );
    }
    n = 1 + tx_count;
    while ( n > 1 )
@@ -1484,13 +1510,21 @@ static bool submit_upstream_work( CURL *curl, struct work *work )
    {
       char *req = NULL;
       json_t *val, *res;
+      int err = 0;
 
       req = algo_gate.malloc_txs_request( work );
-      val = json_rpc_call( curl, rpc_url, rpc_userpass, req, NULL, 0 );
+      val = json_rpc_call( curl, rpc_url, rpc_userpass, req, &err, 0 );
       free( req );
 
       if ( unlikely( !val ) )
       {
+         // A negative code is a JSON-RPC error from the node (e.g. -22 block
+         // decode failed): resending the same block cannot succeed.
+         if ( err < 0 )
+         {
+            share_result( false, work, "submitblock error, see above" );
+            return true;
+         }
          applog( LOG_ERR, "submit_upstream_work json_rpc_call failed" );
          return false;
       }
@@ -1527,8 +1561,10 @@ const char *getwork_req =
 
 #define GBT_CAPABILITIES "[\"coinbasetxn\", \"coinbasevalue\", \"longpoll\", \"workid\"]"
 
-#define GBT_RULES "[\"segwit\"]"
-#define GBT_MWEB_RULES "[\"segwit\", \"mweb\"]"
+// Litecoin-derived nodes with MWEB (Rincoin, Litecoin) refuse getblocktemplate
+// unless the client names both rules, at every height. Nodes without MWEB ignore
+// the unknown rule. gbt_work_decode handles the template's "mweb" field.
+#define GBT_RULES "[\"segwit\", \"mweb\"]"
 
 static const char *gbt_req =
    "{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
@@ -1536,13 +1572,6 @@ static const char *gbt_req =
 const char *gbt_lp_req =
    "{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
    GBT_CAPABILITIES ", \"rules\": " GBT_RULES ", \"longpollid\": \"%s\"}], \"id\":0}\r\n";
-
-static const char *gbt_mweb_req =
-"{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
-GBT_CAPABILITIES ", \"rules\": " GBT_MWEB_RULES "}], \"id\":0}\r\n";
-const char *gbt_lp_mweb_req =
-"{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
-GBT_CAPABILITIES ", \"rules\": " GBT_MWEB_RULES ", \"longpollid\": \"%s\"}], \"id\":0}\r\n";
 
 
 static bool get_upstream_work( CURL *curl, struct work *work )
@@ -1554,15 +1583,10 @@ static bool get_upstream_work( CURL *curl, struct work *work )
 
 start:
    gettimeofday( &tv_start, NULL );
-   if ( opt_mweb )
-      val = json_rpc_call( curl, rpc_url, rpc_userpass,
-                 have_gbt ? gbt_mweb_req : getwork_req, &err,
-                           have_gbt ? JSON_RPC_QUIET_404 : 0);
-   else
-      val = json_rpc_call( curl, rpc_url, rpc_userpass,
-      have_gbt ? gbt_req : getwork_req, &err,
-                have_gbt ? JSON_RPC_QUIET_404 : 0);
- 
+   val = json_rpc_call( curl, rpc_url, rpc_userpass,
+                        have_gbt ? gbt_req : getwork_req, &err,
+                        have_gbt ? JSON_RPC_QUIET_404 : 0 );
+
    gettimeofday( &tv_end, NULL );
 
    if ( have_stratum )
@@ -2470,15 +2494,8 @@ json_t *std_longpoll_rpc_call( CURL *curl, int *err, char* lp_url )
    char *req = NULL;
    if (have_gbt)
    {
-       if (opt_mweb) {
-          req = (char*) malloc( strlen(gbt_lp_mweb_req) + strlen(lp_id) + 1 );
-          sprintf( req, gbt_lp_mweb_req, lp_id );
-       }
-       else
-       {
-          req = (char*) malloc( strlen(gbt_lp_req) + strlen(lp_id) + 1 );
-          sprintf( req, gbt_lp_req, lp_id );
-       }
+      req = (char*) malloc( strlen(gbt_lp_req) + strlen(lp_id) + 1 );
+      sprintf( req, gbt_lp_req, lp_id );
    }
    val = json_rpc_call( curl, rpc_url, rpc_userpass, getwork_req, err,
                         JSON_RPC_LONGPOLL );
@@ -3617,7 +3634,7 @@ void parse_arg(int key, char *arg )
       exit(0);
 	case 'h':   // help
 		show_usage_and_exit(0);
-   case 1032:  // --mweb
+   case 1032:  // --mweb, kept so existing command lines keep working
       opt_mweb = true;
       break;
    default:
