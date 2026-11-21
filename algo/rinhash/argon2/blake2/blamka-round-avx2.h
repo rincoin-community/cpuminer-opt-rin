@@ -94,6 +94,15 @@
     } while ((void)0, 0)
 
 /*
+ * Swapping the two 64-bit words inside each 128-bit half does not cross the
+ * halves, so a 32-bit shuffle does it; swapping the halves is a 128-bit
+ * permute. Both are cheaper than the general 64-bit permute, which costs two
+ * micro-ops and six cycles on AMD Zen 1 and Zen 2.
+ */
+#define swap64_avx2(x)  _mm256_shuffle_epi32((x), _MM_SHUFFLE(1, 0, 3, 2))
+#define swap128_avx2(x) _mm256_permute2x128_si256((x), (x), 1)
+
+/*
  * Diagonal shuffles for BlaMka
  * Used to rearrange data between column and diagonal operations
  */
@@ -104,8 +113,8 @@
         B0 = t0; \
         B1 = t1; \
         \
-        t0 = _mm256_permute4x64_epi64(C0, _MM_SHUFFLE(1, 0, 3, 2)); \
-        t1 = _mm256_permute4x64_epi64(C1, _MM_SHUFFLE(1, 0, 3, 2)); \
+        t0 = swap128_avx2(C0); \
+        t1 = swap128_avx2(C1); \
         C0 = t0; \
         C1 = t1; \
         \
@@ -122,8 +131,8 @@
         B0 = t0; \
         B1 = t1; \
         \
-        t0 = _mm256_permute4x64_epi64(C0, _MM_SHUFFLE(1, 0, 3, 2)); \
-        t1 = _mm256_permute4x64_epi64(C1, _MM_SHUFFLE(1, 0, 3, 2)); \
+        t0 = swap128_avx2(C0); \
+        t1 = swap128_avx2(C1); \
         C0 = t0; \
         C1 = t1; \
         \
@@ -141,8 +150,8 @@
     do { \
         __m256i tmp1 = _mm256_blend_epi32(B0, B1, 0xCC); \
         __m256i tmp2 = _mm256_blend_epi32(B0, B1, 0x33); \
-        B1 = _mm256_permute4x64_epi64(tmp1, _MM_SHUFFLE(2,3,0,1)); \
-        B0 = _mm256_permute4x64_epi64(tmp2, _MM_SHUFFLE(2,3,0,1)); \
+        B1 = swap64_avx2(tmp1); \
+        B0 = swap64_avx2(tmp2); \
         \
         tmp1 = C0; \
         C0 = C1; \
@@ -150,16 +159,16 @@
         \
         tmp1 = _mm256_blend_epi32(D0, D1, 0xCC); \
         tmp2 = _mm256_blend_epi32(D0, D1, 0x33); \
-        D0 = _mm256_permute4x64_epi64(tmp1, _MM_SHUFFLE(2,3,0,1)); \
-        D1 = _mm256_permute4x64_epi64(tmp2, _MM_SHUFFLE(2,3,0,1)); \
+        D0 = swap64_avx2(tmp1); \
+        D1 = swap64_avx2(tmp2); \
     } while ((void)0, 0)
 
 #define UNDIAGONALIZE_2_AVX2(A0, A1, B0, B1, C0, C1, D0, D1) \
     do { \
         __m256i tmp1 = _mm256_blend_epi32(B0, B1, 0xCC); \
         __m256i tmp2 = _mm256_blend_epi32(B0, B1, 0x33); \
-        B0 = _mm256_permute4x64_epi64(tmp1, _MM_SHUFFLE(2,3,0,1)); \
-        B1 = _mm256_permute4x64_epi64(tmp2, _MM_SHUFFLE(2,3,0,1)); \
+        B0 = swap64_avx2(tmp1); \
+        B1 = swap64_avx2(tmp2); \
         \
         tmp1 = C0; \
         C0 = C1; \
@@ -167,8 +176,8 @@
         \
         tmp1 = _mm256_blend_epi32(D0, D1, 0x33); \
         tmp2 = _mm256_blend_epi32(D0, D1, 0xCC); \
-        D0 = _mm256_permute4x64_epi64(tmp1, _MM_SHUFFLE(2,3,0,1)); \
-        D1 = _mm256_permute4x64_epi64(tmp2, _MM_SHUFFLE(2,3,0,1)); \
+        D0 = swap64_avx2(tmp1); \
+        D1 = swap64_avx2(tmp2); \
     } while ((void)0, 0)
 
 /*

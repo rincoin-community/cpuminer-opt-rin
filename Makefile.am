@@ -327,6 +327,13 @@ if ARCH_ARM64
    cpuminer_CFLAGS += -flax-vector-conversions
 endif
 
+# The RinHash hot loops are hand written with intrinsics. With gcc 12 on Zen 2
+# the code generated for -mtune=znver2 (what -march=native selects) is about
+# 6% slower than with generic tuning, so tune this one file generically. The
+# instruction set still comes from CFLAGS.
+algo/rinhash/cpuminer-rinhash_core.o: algo/rinhash/rinhash_core.c
+	$(CC) $(DEFS) $(ALL_INCLUDES) $(cpuminer_CPPFLAGS) $(CPPFLAGS) $(cpuminer_CFLAGS) $(CFLAGS) -mtune=generic -MT $@ -MD -MP -c -o $@ $<
+
 # Argon2 SIMD variants are selected at run time, so each one is built with the
 # instruction set it needs on top of the normal flags.
 argon2_ccflags = $(DEFS) $(ALL_INCLUDES) $(cpuminer_CPPFLAGS) $(CPPFLAGS) $(cpuminer_CFLAGS) $(CFLAGS) -funroll-loops

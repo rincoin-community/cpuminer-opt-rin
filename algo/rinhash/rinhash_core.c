@@ -292,10 +292,35 @@ static void rin_fill_generic( rinhash_ctx_t *ctx )
  */
 #define RIN_LD( p, i )  _mm256_load_si256( (const __m256i*)(p) + (i) )
 
+// Index of the reference block. With a single lane the rules of the
+// Argon2 specification reduce to an area that depends only on the position:
+// in the first pass every block written so far except the previous one, in
+// the second pass the last three segments plus this one up to the previous
+// block. 64 blocks: the modulo is a mask.
 static inline __attribute__ ((always_inline))
-void rin_fill_block( const uint64_t *prev, const uint64_t *ref,
-                     uint64_t *next, const int with_xor )
+uint32_t rin_ref_index( const uint64_t j, const uint32_t pass,
+                        const uint32_t slice, const uint32_t index )
 {
+   const uint64_t j1 = (uint32_t)j;
+   const uint64_t area = pass ? RIN_MEM_BLOCKS - RIN_SEGMENT + index - 1
+                              : slice * RIN_SEGMENT + index - 1;
+   const uint32_t start = ( pass && slice != ARGON2_SYNC_POINTS - 1 )
+                          ? ( slice + 1 ) * RIN_SEGMENT : 0;
+   const uint64_t x = ( j1 * j1 ) >> 32;
+   const uint64_t z = area - 1 - ( ( area * x ) >> 32 );
+   return ( start + (uint32_t)z ) & ( RIN_MEM_BLOCKS - 1 );
+}
+
+// pos = pass * 64 + slice * 16 + index of the block being written.
+static inline __attribute__ ((always_inline))
+void rin_fill_block( block *mem, const uint32_t pos )
+{
+   const uint32_t pass = pos >> 6, slice = ( pos >> 4 ) & 3, index = pos & 15;
+   const uint32_t curr = pos & ( RIN_MEM_BLOCKS - 1 );
+   const uint64_t *prev = mem[ ( curr - 1 ) & ( RIN_MEM_BLOCKS - 1 ) ].v;
+   const uint64_t *ref = mem[ rin_ref_index( prev[0], pass, slice, index ) ].v;
+   uint64_t *next = mem[ curr ].v;
+   const int with_xor = pass;
    __m256i t[32];
 
    for ( int i = 0; i < 32; i += 8 )
@@ -334,37 +359,11 @@ void rin_fill_block( const uint64_t *prev, const uint64_t *ref,
 #undef RIN_OUT
 }
 
-// Index of the reference block. With a single lane the rules of the
-// Argon2 specification reduce to an area that depends only on the position:
-// in the first pass every block written so far except the previous one, in
-// the second pass the last three segments plus this one up to the previous
-// block. 64 blocks: the modulo is a mask.
-static inline __attribute__ ((always_inline))
-uint32_t rin_ref_index( const uint64_t j, const uint32_t pass,
-                        const uint32_t slice, const uint32_t index )
-{
-   const uint64_t j1 = (uint32_t)j;
-   const uint64_t area = pass ? RIN_MEM_BLOCKS - RIN_SEGMENT + index - 1
-                              : slice * RIN_SEGMENT + index - 1;
-   const uint32_t start = ( pass && slice != ARGON2_SYNC_POINTS - 1 )
-                          ? ( slice + 1 ) * RIN_SEGMENT : 0;
-   const uint64_t x = ( j1 * j1 ) >> 32;
-   const uint64_t z = area - 1 - ( ( area * x ) >> 32 );
-   return ( start + (uint32_t)z ) & ( RIN_MEM_BLOCKS - 1 );
-}
-
 static void rin_fill_fast( block *mem )
 {
-   for ( uint32_t pass = 0; pass < RIN_T_COST; pass++ )
-   for ( uint32_t slice = 0; slice < ARGON2_SYNC_POINTS; slice++ )
-   for ( uint32_t index = ( pass | slice ) ? 0 : 2; index < RIN_SEGMENT;
-         index++ )
-   {
-      const uint32_t curr = slice * RIN_SEGMENT + index;
-      const uint64_t *prev = mem[ ( curr - 1 ) & ( RIN_MEM_BLOCKS - 1 ) ].v;
-      const uint32_t ref = rin_ref_index( prev[0], pass, slice, index );
-      rin_fill_block( prev, mem[ ref ].v, mem[ curr ].v, pass );
-   }
+   // The first two blocks of the first pass are already there.
+   for ( uint32_t pos = 2; pos < RIN_T_COST * RIN_MEM_BLOCKS; pos++ )
+      rin_fill_block( mem, pos );
 }
 
 #endif // AVX2

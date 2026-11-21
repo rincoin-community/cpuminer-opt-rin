@@ -4,7 +4,7 @@
 set -e
 cd "$(dirname "$0")/.."
 R=algo/rinhash
-CFLAGS="${CFLAGS:--O3 -march=native}"
+CFLAGS="${CFLAGS:--O3 -march=native -mtune=generic}"
 INC="-I$R -I$R/argon2/include -I$R/argon2 -I$R/argon2/blake2"
 LIB="$R/argon2/cpuminer-core.o $R/argon2/cpuminer-argon2.o
      $R/argon2/cpuminer-encoding.o $R/argon2/cpuminer-ref.o
