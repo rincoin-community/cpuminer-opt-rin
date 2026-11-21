@@ -17,7 +17,7 @@ else
 if WANT_JANSSON
 # Can't find jansson libraries, compile the included source code.
   EXTRA_INCLUDES = -I$(top_srcdir)/compat/jansson
-  EXTRA_LIBS     = -L$(top_srcdir)/compat/jansson
+  EXTRA_LIBS     = -L$(top_builddir)/compat/jansson
 else
   EXTRA_INCLUDES =
   EXTRA_LIBS     =
@@ -291,20 +291,41 @@ cpuminer_SOURCES = \
   algo/rinhash/blake3/blake3.c \
   algo/rinhash/blake3/blake3_dispatch.c \
   algo/rinhash/blake3/blake3_portable.c \
-  algo/rinhash/blake3/blake3_sse2_x86-64_unix.S \
-  algo/rinhash/blake3/blake3_sse41_x86-64_unix.S \
-  algo/rinhash/blake3/blake3_avx2_x86-64_unix.S \
-  algo/rinhash/blake3/blake3_avx512_x86-64_unix.S \
   algo/rinhash/argon2/core.c \
   algo/rinhash/argon2/blake2/blake2b.c \
   algo/rinhash/argon2/encoding.c \
   algo/rinhash/argon2/argon2.c \
   algo/rinhash/argon2/ref.c \
   algo/rinhash/argon2/thread.c \
-  algo/rinhash/argon2/argon2_dispatch.c \
+  algo/rinhash/argon2/argon2_dispatch.c
+
+# Platform specific parts of RinHash.
+# x86-64: BLAKE3 assembly in the calling convention of the target system and
+# the Argon2 fill variants that the library selects at run time.
+# ARM64: BLAKE3 NEON code.
+if ARCH_x86_64
+if HAVE_WINDOWS
+cpuminer_SOURCES += \
+  algo/rinhash/blake3/blake3_sse2_x86-64_windows_gnu.S \
+  algo/rinhash/blake3/blake3_sse41_x86-64_windows_gnu.S \
+  algo/rinhash/blake3/blake3_avx2_x86-64_windows_gnu.S \
+  algo/rinhash/blake3/blake3_avx512_x86-64_windows_gnu.S
+else
+cpuminer_SOURCES += \
+  algo/rinhash/blake3/blake3_sse2_x86-64_unix.S \
+  algo/rinhash/blake3/blake3_sse41_x86-64_unix.S \
+  algo/rinhash/blake3/blake3_avx2_x86-64_unix.S \
+  algo/rinhash/blake3/blake3_avx512_x86-64_unix.S
+endif
+cpuminer_SOURCES += \
   algo/rinhash/argon2/argon2_ssse3.c \
   algo/rinhash/argon2/argon2_avx2.c \
-  algo/rinhash/argon2/argon2_avx512.c 
+  algo/rinhash/argon2/argon2_avx512.c
+endif
+
+if ARCH_ARM64
+cpuminer_SOURCES += algo/rinhash/blake3/blake3_neon.c
+endif
 
 
 if HAVE_WINDOWS
@@ -329,22 +350,32 @@ endif
 
 # The RinHash hot loops are hand written with intrinsics. With gcc 12 on Zen 2
 # the code generated for -mtune=znver2 (what -march=native selects) is about
-# 6% slower than with generic tuning, so tune this one file generically. The
-# instruction set still comes from CFLAGS.
+# 6% slower than with generic tuning, so tune this one file generically on
+# x86-64. The instruction set still comes from CFLAGS.
+if ARCH_x86_64
+   rinhash_tune = -mtune=generic
+else
+   rinhash_tune =
+endif
+
 algo/rinhash/cpuminer-rinhash_core.o: algo/rinhash/rinhash_core.c
-	$(CC) $(DEFS) $(ALL_INCLUDES) $(cpuminer_CPPFLAGS) $(CPPFLAGS) $(cpuminer_CFLAGS) $(CFLAGS) -mtune=generic -MT $@ -MD -MP -c -o $@ $<
+	@$(MKDIR_P) $(@D)
+	$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(ALL_INCLUDES) $(cpuminer_CPPFLAGS) $(CPPFLAGS) $(cpuminer_CFLAGS) $(CFLAGS) $(rinhash_tune) -MT $@ -MD -MP -c -o $@ $<
 
 # Argon2 SIMD variants are selected at run time, so each one is built with the
-# instruction set it needs on top of the normal flags.
-argon2_ccflags = $(DEFS) $(ALL_INCLUDES) $(cpuminer_CPPFLAGS) $(CPPFLAGS) $(cpuminer_CFLAGS) $(CFLAGS) -funroll-loops
+# instruction set it needs on top of the normal flags. x86-64 only, see above.
+argon2_ccflags = $(DEFS) $(DEFAULT_INCLUDES) $(ALL_INCLUDES) $(cpuminer_CPPFLAGS) $(CPPFLAGS) $(cpuminer_CFLAGS) $(CFLAGS) -funroll-loops
 
 algo/rinhash/argon2/cpuminer-argon2_ssse3.o: algo/rinhash/argon2/argon2_ssse3.c
+	@$(MKDIR_P) $(@D)
 	$(CC) $(argon2_ccflags) -mssse3 -DENABLE_SSSE3 -MT $@ -MD -MP -c -o $@ $<
 
 algo/rinhash/argon2/cpuminer-argon2_avx2.o: algo/rinhash/argon2/argon2_avx2.c
+	@$(MKDIR_P) $(@D)
 	$(CC) $(argon2_ccflags) -mavx2 -DENABLE_AVX2 -MT $@ -MD -MP -c -o $@ $<
 
 algo/rinhash/argon2/cpuminer-argon2_avx512.o: algo/rinhash/argon2/argon2_avx512.c
+	@$(MKDIR_P) $(@D)
 	$(CC) $(argon2_ccflags) -mavx512f -mavx512dq -DENABLE_AVX512 -MT $@ -MD -MP -c -o $@ $<
 
 if HAVE_WINDOWS
