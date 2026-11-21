@@ -274,8 +274,6 @@ static void rin_fill_generic( rinhash_ctx_t *ctx )
 
 #if defined(__AVX2__)
 
-#include "argon2/blake2/blamka-round-avx2.h"
-
 #define RIN_FAST_FILL   "AVX2 (RinHash specific)"
 
 /*
@@ -311,10 +309,121 @@ uint32_t rin_ref_index( const uint64_t j, const uint32_t pass,
    return ( start + (uint32_t)z ) & ( RIN_MEM_BLOCKS - 1 );
 }
 
+/*
+ * BlaMka rounds over four independent sets of (a, b, c, d) rows at once.
+ *
+ * One set is a dependency chain: every step needs the result of the one
+ * before it, and a multiply-add step takes six cycles. Written set after
+ * set, as two calls of the usual two-set round, the second pair of sets
+ * comes more instructions later than the CPU looks ahead when two threads
+ * share the core, so it waits for the first pair although it does not
+ * depend on it. Here each step is issued for all four sets before the next
+ * step, which keeps four chains in flight.
+ */
+#define RIN_ROR32( x )  _mm256_shuffle_epi32( x, _MM_SHUFFLE( 2, 3, 0, 1 ) )
+#define RIN_ROR24( x )  _mm256_shuffle_epi8( x, r24 )
+#define RIN_ROR16( x )  _mm256_shuffle_epi8( x, r16 )
+#define RIN_ROR63( x )  _mm256_xor_si256( _mm256_srli_epi64( x, 63 ), \
+                                          _mm256_add_epi64( x, x ) )
+#define RIN_SWAP64( x )  _mm256_shuffle_epi32( x, _MM_SHUFFLE( 1, 0, 3, 2 ) )
+#define RIN_SWAP128( x ) _mm256_permute2x128_si256( x, x, 1 )
+
+// x = x + y + 2 * lo32(x) * lo32(y)
+#define RIN_MULADD( x, y ) \
+do { \
+   __m256i ml_ = _mm256_mul_epu32( x, y ); \
+   ml_ = _mm256_add_epi64( ml_, ml_ ); \
+   x = _mm256_add_epi64( x, _mm256_add_epi64( y, ml_ ) ); \
+} while (0)
+
+#define RIN_STEP4( X0, Y0, X1, Y1, X2, Y2, X3, Y3, Z0, Z1, Z2, Z3, ROR ) \
+do { \
+   RIN_MULADD( X0, Y0 );  RIN_MULADD( X1, Y1 ); \
+   RIN_MULADD( X2, Y2 );  RIN_MULADD( X3, Y3 ); \
+   Z0 = ROR( _mm256_xor_si256( Z0, X0 ) ); \
+   Z1 = ROR( _mm256_xor_si256( Z1, X1 ) ); \
+   Z2 = ROR( _mm256_xor_si256( Z2, X2 ) ); \
+   Z3 = ROR( _mm256_xor_si256( Z3, X3 ) ); \
+} while (0)
+
+#define RIN_G4( A0, B0, C0, D0, A1, B1, C1, D1, \
+                A2, B2, C2, D2, A3, B3, C3, D3 ) \
+do { \
+   RIN_STEP4( A0, B0, A1, B1, A2, B2, A3, B3, D0, D1, D2, D3, RIN_ROR32 ); \
+   RIN_STEP4( C0, D0, C1, D1, C2, D2, C3, D3, B0, B1, B2, B3, RIN_ROR24 ); \
+   RIN_STEP4( A0, B0, A1, B1, A2, B2, A3, B3, D0, D1, D2, D3, RIN_ROR16 ); \
+   RIN_STEP4( C0, D0, C1, D1, C2, D2, C3, D3, B0, B1, B2, B3, RIN_ROR63 ); \
+} while (0)
+
+// Column round: a set is one 16-word group, each row in one register. The
+// diagonals come from rotating rows b, c and d by one, two and three words.
+#define RIN_ROWS_ROT( B, C, D, IB, ID ) \
+do { \
+   B = _mm256_permute4x64_epi64( B, IB ); \
+   C = RIN_SWAP128( C ); \
+   D = _mm256_permute4x64_epi64( D, ID ); \
+} while (0)
+
+#define RIN_ROUND_COLS( A0, B0, C0, D0, A1, B1, C1, D1, \
+                        A2, B2, C2, D2, A3, B3, C3, D3 ) \
+do { \
+   RIN_G4( A0, B0, C0, D0, A1, B1, C1, D1, A2, B2, C2, D2, A3, B3, C3, D3 ); \
+   RIN_ROWS_ROT( B0, C0, D0, _MM_SHUFFLE( 0, 3, 2, 1 ), _MM_SHUFFLE( 2, 1, 0, 3 ) ); \
+   RIN_ROWS_ROT( B1, C1, D1, _MM_SHUFFLE( 0, 3, 2, 1 ), _MM_SHUFFLE( 2, 1, 0, 3 ) ); \
+   RIN_ROWS_ROT( B2, C2, D2, _MM_SHUFFLE( 0, 3, 2, 1 ), _MM_SHUFFLE( 2, 1, 0, 3 ) ); \
+   RIN_ROWS_ROT( B3, C3, D3, _MM_SHUFFLE( 0, 3, 2, 1 ), _MM_SHUFFLE( 2, 1, 0, 3 ) ); \
+   RIN_G4( A0, B0, C0, D0, A1, B1, C1, D1, A2, B2, C2, D2, A3, B3, C3, D3 ); \
+   RIN_ROWS_ROT( B0, C0, D0, _MM_SHUFFLE( 2, 1, 0, 3 ), _MM_SHUFFLE( 0, 3, 2, 1 ) ); \
+   RIN_ROWS_ROT( B1, C1, D1, _MM_SHUFFLE( 2, 1, 0, 3 ), _MM_SHUFFLE( 0, 3, 2, 1 ) ); \
+   RIN_ROWS_ROT( B2, C2, D2, _MM_SHUFFLE( 2, 1, 0, 3 ), _MM_SHUFFLE( 0, 3, 2, 1 ) ); \
+   RIN_ROWS_ROT( B3, C3, D3, _MM_SHUFFLE( 2, 1, 0, 3 ), _MM_SHUFFLE( 0, 3, 2, 1 ) ); \
+} while (0)
+
+// Row round: two sets share their rows, half a row of each per 128-bit
+// half of a register. Sets 0 and 1 are one such pair, sets 2 and 3 another.
+#define RIN_PAIR_DIAG( B0, C0, D0, B1, C1, D1 ) \
+do { \
+   __m256i t1_ = _mm256_blend_epi32( B0, B1, 0xCC ); \
+   __m256i t2_ = _mm256_blend_epi32( B0, B1, 0x33 ); \
+   B1 = RIN_SWAP64( t1_ );  B0 = RIN_SWAP64( t2_ ); \
+   t1_ = C0;  C0 = C1;  C1 = t1_; \
+   t1_ = _mm256_blend_epi32( D0, D1, 0xCC ); \
+   t2_ = _mm256_blend_epi32( D0, D1, 0x33 ); \
+   D0 = RIN_SWAP64( t1_ );  D1 = RIN_SWAP64( t2_ ); \
+} while (0)
+
+#define RIN_PAIR_UNDIAG( B0, C0, D0, B1, C1, D1 ) \
+do { \
+   __m256i t1_ = _mm256_blend_epi32( B0, B1, 0xCC ); \
+   __m256i t2_ = _mm256_blend_epi32( B0, B1, 0x33 ); \
+   B0 = RIN_SWAP64( t1_ );  B1 = RIN_SWAP64( t2_ ); \
+   t1_ = C0;  C0 = C1;  C1 = t1_; \
+   t1_ = _mm256_blend_epi32( D0, D1, 0x33 ); \
+   t2_ = _mm256_blend_epi32( D0, D1, 0xCC ); \
+   D0 = RIN_SWAP64( t1_ );  D1 = RIN_SWAP64( t2_ ); \
+} while (0)
+
+#define RIN_ROUND_ROWS( A0, B0, C0, D0, A1, B1, C1, D1, \
+                        A2, B2, C2, D2, A3, B3, C3, D3 ) \
+do { \
+   RIN_G4( A0, B0, C0, D0, A1, B1, C1, D1, A2, B2, C2, D2, A3, B3, C3, D3 ); \
+   RIN_PAIR_DIAG( B0, C0, D0, B1, C1, D1 ); \
+   RIN_PAIR_DIAG( B2, C2, D2, B3, C3, D3 ); \
+   RIN_G4( A0, B0, C0, D0, A1, B1, C1, D1, A2, B2, C2, D2, A3, B3, C3, D3 ); \
+   RIN_PAIR_UNDIAG( B0, C0, D0, B1, C1, D1 ); \
+   RIN_PAIR_UNDIAG( B2, C2, D2, B3, C3, D3 ); \
+} while (0)
+
 // pos = pass * 64 + slice * 16 + index of the block being written.
 static inline __attribute__ ((always_inline))
 void rin_fill_block( block *mem, const uint32_t pos )
 {
+   const __m256i r24 = _mm256_setr_epi8(
+                     3, 4, 5, 6, 7, 0, 1, 2, 11, 12, 13, 14, 15, 8, 9, 10,
+                     3, 4, 5, 6, 7, 0, 1, 2, 11, 12, 13, 14, 15, 8, 9, 10 );
+   const __m256i r16 = _mm256_setr_epi8(
+                     2, 3, 4, 5, 6, 7, 0, 1, 10, 11, 12, 13, 14, 15, 8, 9,
+                     2, 3, 4, 5, 6, 7, 0, 1, 10, 11, 12, 13, 14, 15, 8, 9 );
    const uint32_t pass = pos >> 6, slice = ( pos >> 4 ) & 3, index = pos & 15;
    const uint32_t curr = pos & ( RIN_MEM_BLOCKS - 1 );
    const uint64_t *prev = mem[ ( curr - 1 ) & ( RIN_MEM_BLOCKS - 1 ) ].v;
@@ -323,40 +432,55 @@ void rin_fill_block( block *mem, const uint32_t pos )
    const int with_xor = pass;
    __m256i t[32];
 
-   for ( int i = 0; i < 32; i += 8 )
+#define RIN_IN( k )  _mm256_xor_si256( RIN_LD( prev, k ), RIN_LD( ref, k ) )
+
+   // Column rounds: the eight 16-word groups, four at a time.
+   for ( int i = 0; i < 32; i += 16 )
    {
-      __m256i a0 = _mm256_xor_si256( RIN_LD( prev, i+0 ), RIN_LD( ref, i+0 ) );
-      __m256i a1 = _mm256_xor_si256( RIN_LD( prev, i+1 ), RIN_LD( ref, i+1 ) );
-      __m256i a2 = _mm256_xor_si256( RIN_LD( prev, i+2 ), RIN_LD( ref, i+2 ) );
-      __m256i a3 = _mm256_xor_si256( RIN_LD( prev, i+3 ), RIN_LD( ref, i+3 ) );
-      __m256i a4 = _mm256_xor_si256( RIN_LD( prev, i+4 ), RIN_LD( ref, i+4 ) );
-      __m256i a5 = _mm256_xor_si256( RIN_LD( prev, i+5 ), RIN_LD( ref, i+5 ) );
-      __m256i a6 = _mm256_xor_si256( RIN_LD( prev, i+6 ), RIN_LD( ref, i+6 ) );
-      __m256i a7 = _mm256_xor_si256( RIN_LD( prev, i+7 ), RIN_LD( ref, i+7 ) );
-      BLAKE2_ROUND_1_AVX2( a0, a4, a1, a5, a2, a6, a3, a7 );
-      t[i+0] = a0;  t[i+1] = a1;  t[i+2] = a2;  t[i+3] = a3;
-      t[i+4] = a4;  t[i+5] = a5;  t[i+6] = a6;  t[i+7] = a7;
+      __m256i x0  = RIN_IN( i+0  ), x1  = RIN_IN( i+1  );
+      __m256i x2  = RIN_IN( i+2  ), x3  = RIN_IN( i+3  );
+      __m256i x4  = RIN_IN( i+4  ), x5  = RIN_IN( i+5  );
+      __m256i x6  = RIN_IN( i+6  ), x7  = RIN_IN( i+7  );
+      __m256i x8  = RIN_IN( i+8  ), x9  = RIN_IN( i+9  );
+      __m256i x10 = RIN_IN( i+10 ), x11 = RIN_IN( i+11 );
+      __m256i x12 = RIN_IN( i+12 ), x13 = RIN_IN( i+13 );
+      __m256i x14 = RIN_IN( i+14 ), x15 = RIN_IN( i+15 );
+      RIN_ROUND_COLS( x0, x1, x2,  x3,  x4,  x5,  x6,  x7,
+                      x8, x9, x10, x11, x12, x13, x14, x15 );
+      t[i+0]  = x0;   t[i+1]  = x1;   t[i+2]  = x2;   t[i+3]  = x3;
+      t[i+4]  = x4;   t[i+5]  = x5;   t[i+6]  = x6;   t[i+7]  = x7;
+      t[i+8]  = x8;   t[i+9]  = x9;   t[i+10] = x10;  t[i+11] = x11;
+      t[i+12] = x12;  t[i+13] = x13;  t[i+14] = x14;  t[i+15] = x15;
    }
 
 #define RIN_OUT( a, k ) \
    do { \
-      __m256i x_ = _mm256_xor_si256( a, _mm256_xor_si256( RIN_LD( prev, k ), \
-                                                         RIN_LD( ref, k ) ) ); \
+      __m256i x_ = _mm256_xor_si256( a, RIN_IN( k ) ); \
       if ( with_xor ) x_ = _mm256_xor_si256( x_, RIN_LD( next, k ) ); \
       _mm256_store_si256( (__m256i*)next + (k), x_ ); \
    } while (0)
 
-   for ( int i = 0; i < 4; i++ )
+   // Row rounds: registers i, 4+i, ... 28+i hold two interleaved 16-word
+   // groups; i and i+1 together are four sets.
+   for ( int i = 0; i < 4; i += 2 )
    {
-      __m256i a0 = t[i],     a1 = t[4+i],  a2 = t[8+i],  a3 = t[12+i];
-      __m256i a4 = t[16+i],  a5 = t[20+i], a6 = t[24+i], a7 = t[28+i];
-      BLAKE2_ROUND_2_AVX2( a0, a1, a2, a3, a4, a5, a6, a7 );
+      __m256i a0 = t[i],     a1 = t[4+i],  b0 = t[8+i],  b1 = t[12+i];
+      __m256i c0 = t[16+i],  c1 = t[20+i], d0 = t[24+i], d1 = t[28+i];
+      __m256i a2 = t[i+1],   a3 = t[5+i],  b2 = t[9+i],  b3 = t[13+i];
+      __m256i c2 = t[17+i],  c3 = t[21+i], d2 = t[25+i], d3 = t[29+i];
+      RIN_ROUND_ROWS( a0, b0, c0, d0, a1, b1, c1, d1,
+                      a2, b2, c2, d2, a3, b3, c3, d3 );
       RIN_OUT( a0, i );       RIN_OUT( a1, 4+i );
-      RIN_OUT( a2, 8+i );     RIN_OUT( a3, 12+i );
-      RIN_OUT( a4, 16+i );    RIN_OUT( a5, 20+i );
-      RIN_OUT( a6, 24+i );    RIN_OUT( a7, 28+i );
+      RIN_OUT( b0, 8+i );     RIN_OUT( b1, 12+i );
+      RIN_OUT( c0, 16+i );    RIN_OUT( c1, 20+i );
+      RIN_OUT( d0, 24+i );    RIN_OUT( d1, 28+i );
+      RIN_OUT( a2, i+1 );     RIN_OUT( a3, 5+i );
+      RIN_OUT( b2, 9+i );     RIN_OUT( b3, 13+i );
+      RIN_OUT( c2, 17+i );    RIN_OUT( c3, 21+i );
+      RIN_OUT( d2, 25+i );    RIN_OUT( d3, 29+i );
    }
 #undef RIN_OUT
+#undef RIN_IN
 }
 
 static void rin_fill_fast( block *mem )
