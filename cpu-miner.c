@@ -82,25 +82,6 @@
 #include <Mmsystem.h>
 #pragma comment(lib, "winmm.lib")
 #endif
-#if defined(_WIN32) || defined(_WIN64)
-    // Windows (MinGWなど) 向け：LEなので変換が必要な場合は bswap を使う
-    static inline uint32_t htole32(uint32_t x) {
-        return ((x >> 24) & 0x000000FF) |
-               ((x >> 8)  & 0x0000FF00) |
-               ((x << 8)  & 0x00FF0000) |
-               ((x << 24) & 0xFF000000);
-    }
-    static inline uint32_t htobe32(uint32_t x) {
-      return ((x >> 24) & 0x000000FF) |
-             ((x >> 8)  & 0x0000FF00) |
-             ((x << 8)  & 0x00FF0000) |
-             ((x << 24) & 0xFF000000);
-  }
-#else
-    // Linux/Unix：標準の htole32 を使う
-    #include <endian.h>
-#endif
-
 #define LP_SCANTIME		60
 
 algo_gate_t algo_gate;

@@ -8,7 +8,9 @@
 set -euo pipefail
 SRC=$(cd "$(dirname "$0")/.." && pwd)
 version=$(sed -n 's/^AC_INIT(\[cpuminer-opt\], *\[\(.*\)\]).*/\1/p' "$SRC/configure.ac")
-commit=$(git -C "$SRC" rev-parse --short=7 HEAD)
+# GITHUB_SHA is set in the workflow; the MSYS2 shell there has no git.
+commit=${GITHUB_SHA:-$(git -C "$SRC" rev-parse HEAD)}
+commit=$(echo "$commit" | cut -c1-7)
 tag="v$version-rin.$commit"
 
 if [ "$1" = "--tag" ]; then
