@@ -261,7 +261,8 @@ static inline void rin_sha3_256( void *out32, const void *in32 )
    memcpy( out32, st, 32 );
 }
 
-static inline void rin_fill( rinhash_ctx_t *ctx )
+// Generic memory fill: the Argon2 library code selected at run time.
+static void rin_fill_generic( rinhash_ctx_t *ctx )
 {
    for ( uint32_t pass = 0; pass < RIN_T_COST; pass++ )
    for ( uint32_t slice = 0; slice < ARGON2_SYNC_POINTS; slice++ )
@@ -269,6 +270,118 @@ static inline void rin_fill( rinhash_ctx_t *ctx )
       argon2_position_t pos = { pass, 0, (uint8_t)slice, 0 };
       fill_segment_dispatch( &ctx->inst, pos );
    }
+}
+
+#if defined(__AVX2__)
+
+#include "argon2/blake2/blamka-round-avx2.h"
+
+#define RIN_FAST_FILL   "AVX2 (RinHash specific)"
+
+/*
+ * Memory fill written for the RinHash geometry: Argon2d, one lane of 64
+ * blocks, two passes, version 1.3.
+ *
+ * new block = P( prev ^ ref ) ^ prev ^ ref, in the second pass also ^ old
+ * block. P is a column round over eight groups of 256-bit words followed by
+ * a row round. The usual code first builds prev ^ ref in a state array and a
+ * copy of it, runs the rounds on the state, then combines both. Here the
+ * column rounds take prev ^ ref straight from the two blocks and the row
+ * rounds write the finished words to the new block, which removes two passes
+ * over the 1 KiB state.
+ */
+#define RIN_LD( p, i )  _mm256_load_si256( (const __m256i*)(p) + (i) )
+
+static inline __attribute__ ((always_inline))
+void rin_fill_block( const uint64_t *prev, const uint64_t *ref,
+                     uint64_t *next, const int with_xor )
+{
+   __m256i t[32];
+
+   for ( int i = 0; i < 32; i += 8 )
+   {
+      __m256i a0 = _mm256_xor_si256( RIN_LD( prev, i+0 ), RIN_LD( ref, i+0 ) );
+      __m256i a1 = _mm256_xor_si256( RIN_LD( prev, i+1 ), RIN_LD( ref, i+1 ) );
+      __m256i a2 = _mm256_xor_si256( RIN_LD( prev, i+2 ), RIN_LD( ref, i+2 ) );
+      __m256i a3 = _mm256_xor_si256( RIN_LD( prev, i+3 ), RIN_LD( ref, i+3 ) );
+      __m256i a4 = _mm256_xor_si256( RIN_LD( prev, i+4 ), RIN_LD( ref, i+4 ) );
+      __m256i a5 = _mm256_xor_si256( RIN_LD( prev, i+5 ), RIN_LD( ref, i+5 ) );
+      __m256i a6 = _mm256_xor_si256( RIN_LD( prev, i+6 ), RIN_LD( ref, i+6 ) );
+      __m256i a7 = _mm256_xor_si256( RIN_LD( prev, i+7 ), RIN_LD( ref, i+7 ) );
+      BLAKE2_ROUND_1_AVX2( a0, a4, a1, a5, a2, a6, a3, a7 );
+      t[i+0] = a0;  t[i+1] = a1;  t[i+2] = a2;  t[i+3] = a3;
+      t[i+4] = a4;  t[i+5] = a5;  t[i+6] = a6;  t[i+7] = a7;
+   }
+
+#define RIN_OUT( a, k ) \
+   do { \
+      __m256i x_ = _mm256_xor_si256( a, _mm256_xor_si256( RIN_LD( prev, k ), \
+                                                         RIN_LD( ref, k ) ) ); \
+      if ( with_xor ) x_ = _mm256_xor_si256( x_, RIN_LD( next, k ) ); \
+      _mm256_store_si256( (__m256i*)next + (k), x_ ); \
+   } while (0)
+
+   for ( int i = 0; i < 4; i++ )
+   {
+      __m256i a0 = t[i],     a1 = t[4+i],  a2 = t[8+i],  a3 = t[12+i];
+      __m256i a4 = t[16+i],  a5 = t[20+i], a6 = t[24+i], a7 = t[28+i];
+      BLAKE2_ROUND_2_AVX2( a0, a1, a2, a3, a4, a5, a6, a7 );
+      RIN_OUT( a0, i );       RIN_OUT( a1, 4+i );
+      RIN_OUT( a2, 8+i );     RIN_OUT( a3, 12+i );
+      RIN_OUT( a4, 16+i );    RIN_OUT( a5, 20+i );
+      RIN_OUT( a6, 24+i );    RIN_OUT( a7, 28+i );
+   }
+#undef RIN_OUT
+}
+
+// Index of the reference block. With a single lane the rules of the
+// Argon2 specification reduce to an area that depends only on the position:
+// in the first pass every block written so far except the previous one, in
+// the second pass the last three segments plus this one up to the previous
+// block. 64 blocks: the modulo is a mask.
+static inline __attribute__ ((always_inline))
+uint32_t rin_ref_index( const uint64_t j, const uint32_t pass,
+                        const uint32_t slice, const uint32_t index )
+{
+   const uint64_t j1 = (uint32_t)j;
+   const uint64_t area = pass ? RIN_MEM_BLOCKS - RIN_SEGMENT + index - 1
+                              : slice * RIN_SEGMENT + index - 1;
+   const uint32_t start = ( pass && slice != ARGON2_SYNC_POINTS - 1 )
+                          ? ( slice + 1 ) * RIN_SEGMENT : 0;
+   const uint64_t x = ( j1 * j1 ) >> 32;
+   const uint64_t z = area - 1 - ( ( area * x ) >> 32 );
+   return ( start + (uint32_t)z ) & ( RIN_MEM_BLOCKS - 1 );
+}
+
+static void rin_fill_fast( block *mem )
+{
+   for ( uint32_t pass = 0; pass < RIN_T_COST; pass++ )
+   for ( uint32_t slice = 0; slice < ARGON2_SYNC_POINTS; slice++ )
+   for ( uint32_t index = ( pass | slice ) ? 0 : 2; index < RIN_SEGMENT;
+         index++ )
+   {
+      const uint32_t curr = slice * RIN_SEGMENT + index;
+      const uint64_t *prev = mem[ ( curr - 1 ) & ( RIN_MEM_BLOCKS - 1 ) ].v;
+      const uint32_t ref = rin_ref_index( prev[0], pass, slice, index );
+      rin_fill_block( prev, mem[ ref ].v, mem[ curr ].v, pass );
+   }
+}
+
+#endif // AVX2
+
+// Cleared by the self test if the RinHash specific fill gives a wrong result.
+static int rin_use_fast_fill = 1;
+
+static inline void rin_fill( rinhash_ctx_t *ctx )
+{
+#ifdef RIN_FAST_FILL
+   if ( likely( rin_use_fast_fill ) )
+   {
+      rin_fill_fast( ctx->memory );
+      return;
+   }
+#endif
+   rin_fill_generic( ctx );
 }
 
 // One hash, using the Argon2 library building blocks directly.
@@ -741,9 +854,10 @@ int rinhash_selftest( void )
 
    if ( bad_1way )
    {
-      fprintf( stderr, "RinHash self test: the %s Argon2 fill is wrong, "
-               "using the reference code\n", argon2_get_impl_name() );
+      fprintf( stderr, "RinHash self test: the optimized Argon2 fill is "
+               "wrong, using the reference code\n" );
       argon2_set_impl( ARGON2_IMPL_REF );
+      rin_use_fast_fill = 0;
       rin_use_nway = 0;
       return 1;
    }
@@ -759,14 +873,17 @@ int rinhash_selftest( void )
 
 const char *rinhash_impl_name( void )
 {
-   static char name[80];
+   static char name[96];
+   const char *fill = argon2_get_impl_name();
+#ifdef RIN_FAST_FILL
+   if ( rin_use_fast_fill ) fill = RIN_FAST_FILL;
+#endif
 #if RINHASH_BATCH > 1
    if ( rin_use_nway )
       snprintf( name, sizeof(name), V_NAME " BLAKE2b and SHA3, Argon2 fill %s",
-                argon2_get_impl_name() );
+                fill );
    else
 #endif
-   snprintf( name, sizeof(name), "1-way, Argon2 fill %s",
-             argon2_get_impl_name() );
+   snprintf( name, sizeof(name), "1-way, Argon2 fill %s", fill );
    return name;
 }

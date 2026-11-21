@@ -11,7 +11,6 @@
 #ifndef BLAMKA_ROUND_AVX2_H
 #define BLAMKA_ROUND_AVX2_H
 
-#include "blake2-impl.h"
 
 #if defined(__AVX2__)
 
