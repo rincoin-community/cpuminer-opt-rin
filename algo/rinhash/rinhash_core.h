@@ -14,11 +14,16 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* Number of consecutive nonces hashed by one rinhash_hash_batch call. */
-#if defined(__AVX512F__)
+/* Number of consecutive nonces hashed by one rinhash_hash_batch call: one
+   per 64-bit element of the widest vector register in use.
+   RINHASH_TEST_8WAY builds the 8-way code on two AVX2 registers so that its
+   logic can be tested on a CPU without AVX-512. */
+#if defined(__AVX512F__) || defined(RINHASH_TEST_8WAY)
 #define RINHASH_BATCH 8
 #elif defined(__AVX2__)
 #define RINHASH_BATCH 4
+#elif defined(__SSE2__)
+#define RINHASH_BATCH 2
 #else
 #define RINHASH_BATCH 1
 #endif

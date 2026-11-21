@@ -542,7 +542,8 @@ static void rin_hash_1way( rinhash_ctx_t *ctx, uint32_t nonce, void *out32 )
 
 /*
  * N-way code: N consecutive nonces are hashed together, one nonce per 64-bit
- * element of a vector register (N = 4 with AVX2, 8 with AVX-512).
+ * element of a vector register (N = 2 with SSE2, 4 with AVX2, 8 with
+ * AVX-512).
  *
  * BLAKE2b and Keccak are sequences of 64-bit additions, XORs and rotations
  * with no data dependent branches or addresses, so N independent hashes run
@@ -551,10 +552,61 @@ static void rin_hash_1way( rinhash_ctx_t *ctx, uint32_t nonce, void *out32 )
  * nonce on the single 64 KiB buffer.
  */
 
-#if RINHASH_BATCH == 8
+#if defined(RINHASH_TEST_8WAY)
+
+// Eight lanes on a pair of AVX2 registers, to test the 8-way code paths.
+typedef struct { __m256i l, h; } vec_t;
+#define V_TEST2( name, f ) \
+   static inline vec_t name( vec_t a, vec_t b ) \
+   { return (vec_t){ f( a.l, b.l ), f( a.h, b.h ) }; }
+V_TEST2( v_add_test,  _mm256_add_epi64 )
+V_TEST2( v_xor_test,  _mm256_xor_si256 )
+V_TEST2( v_or_test,   _mm256_or_si256 )
+V_TEST2( v_andn_test, _mm256_andnot_si256 )
+static inline vec_t v_set1_test( uint64_t x )
+{
+   return (vec_t){ _mm256_set1_epi64x( (long long)x ),
+                   _mm256_set1_epi64x( (long long)x ) };
+}
+static inline vec_t v_load_test( const void *p )
+{
+   return (vec_t){ _mm256_load_si256( (const __m256i*)p ),
+                   _mm256_load_si256( (const __m256i*)p + 1 ) };
+}
+static inline void v_store_test( void *p, vec_t v )
+{
+   _mm256_store_si256( (__m256i*)p, v.l );
+   _mm256_store_si256( (__m256i*)p + 1, v.h );
+}
+static inline vec_t v_slli_test( vec_t a, int n )
+{
+   return (vec_t){ _mm256_slli_epi64( a.l, n ), _mm256_slli_epi64( a.h, n ) };
+}
+static inline vec_t v_srli_test( vec_t a, int n )
+{
+   return (vec_t){ _mm256_srli_epi64( a.l, n ), _mm256_srli_epi64( a.h, n ) };
+}
+#define V_ADD( a, b )      v_add_test( a, b )
+#define V_XOR( a, b )      v_xor_test( a, b )
+#define V_OR( a, b )       v_or_test( a, b )
+#define V_ANDN( a, b )     v_andn_test( a, b )
+#define V_SET1( x )        v_set1_test( x )
+#define V_ZERO             v_set1_test( 0 )
+#define V_LOAD( p )        v_load_test( p )
+#define V_STORE( p, v )    v_store_test( p, v )
+#define V_SLLI( a, n )     v_slli_test( a, n )
+#define V_SRLI( a, n )     v_srli_test( a, n )
+#define V_ROL( a, n )      v_or_test( v_slli_test( a, n ), \
+                                      v_srli_test( a, 64 - (n) ) )
+#define V_ROR32( a )       V_ROL( a, 32 )
+#define V_ROR24( a )       V_ROL( a, 40 )
+#define V_ROR16( a )       V_ROL( a, 48 )
+#define V_ROR63( a )       V_ROL( a, 1 )
+#define V_NAME             "8-way (test build on AVX2)"
+
+#elif RINHASH_BATCH == 8
 
 typedef __m512i vec_t;
-#define V_ALIGN            64
 #define V_ADD( a, b )      _mm512_add_epi64( a, b )
 #define V_XOR( a, b )      _mm512_xor_si512( a, b )
 #define V_OR( a, b )       _mm512_or_si512( a, b )
@@ -572,10 +624,9 @@ typedef __m512i vec_t;
 #define V_ROR63( a )       _mm512_ror_epi64( a, 63 )
 #define V_NAME             "8-way AVX-512"
 
-#else
+#elif RINHASH_BATCH == 4
 
 typedef __m256i vec_t;
-#define V_ALIGN            32
 #define V_ADD( a, b )      _mm256_add_epi64( a, b )
 #define V_XOR( a, b )      _mm256_xor_si256( a, b )
 #define V_OR( a, b )       _mm256_or_si256( a, b )
@@ -596,6 +647,34 @@ typedef __m256i vec_t;
                               2, 3, 4, 5, 6, 7, 0, 1, 10, 11, 12, 13, 14, 15, 8, 9 ) )
 #define V_ROR63( a )       V_OR( V_SRLI( a, 63 ), V_ADD( a, a ) )
 #define V_NAME             "4-way AVX2"
+
+#else
+
+typedef __m128i vec_t;
+#define V_ADD( a, b )      _mm_add_epi64( a, b )
+#define V_XOR( a, b )      _mm_xor_si128( a, b )
+#define V_OR( a, b )       _mm_or_si128( a, b )
+#define V_ANDN( a, b )     _mm_andnot_si128( a, b )
+#define V_SET1( x )        _mm_set1_epi64x( (long long)(x) )
+#define V_ZERO             _mm_setzero_si128()
+#define V_LOAD( p )        _mm_load_si128( (const __m128i*)(p) )
+#define V_STORE( p, v )    _mm_store_si128( (__m128i*)(p), v )
+#define V_SLLI( a, n )     _mm_slli_epi64( a, n )
+#define V_SRLI( a, n )     _mm_srli_epi64( a, n )
+#define V_ROL( a, n )      V_OR( V_SLLI( a, n ), V_SRLI( a, 64 - (n) ) )
+#define V_ROR32( a )       _mm_shuffle_epi32( a, _MM_SHUFFLE( 2, 3, 0, 1 ) )
+#if defined(__SSSE3__)
+#define V_ROR24( a )       _mm_shuffle_epi8( a, _mm_setr_epi8( \
+                              3, 4, 5, 6, 7, 0, 1, 2, 11, 12, 13, 14, 15, 8, 9, 10 ) )
+#define V_ROR16( a )       _mm_shuffle_epi8( a, _mm_setr_epi8( \
+                              2, 3, 4, 5, 6, 7, 0, 1, 10, 11, 12, 13, 14, 15, 8, 9 ) )
+#define V_NAME             "2-way SSSE3"
+#else
+#define V_ROR24( a )       V_ROL( a, 40 )
+#define V_ROR16( a )       V_ROL( a, 48 )
+#define V_NAME             "2-way SSE2"
+#endif
+#define V_ROR63( a )       V_OR( V_SRLI( a, 63 ), V_ADD( a, a ) )
 
 #endif
 
