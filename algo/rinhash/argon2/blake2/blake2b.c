@@ -163,6 +163,85 @@ int blake2b_init_key(blake2b_state *S, size_t outlen, const void *key,
     return 0;
 }
 
+#if defined(__AVX2__)
+
+#include <immintrin.h>
+
+/*
+ * AVX2 compression function: each of the four rows of the BLAKE2b state lives
+ * in one 256-bit register, so a column step or a diagonal step is one
+ * vectorized G.
+ */
+static void blake2b_compress(blake2b_state *S, const uint8_t *block) {
+    const __m256i r24 = _mm256_setr_epi8(
+        3, 4, 5, 6, 7, 0, 1, 2, 11, 12, 13, 14, 15, 8, 9, 10,
+        3, 4, 5, 6, 7, 0, 1, 2, 11, 12, 13, 14, 15, 8, 9, 10);
+    const __m256i r16 = _mm256_setr_epi8(
+        2, 3, 4, 5, 6, 7, 0, 1, 10, 11, 12, 13, 14, 15, 8, 9,
+        2, 3, 4, 5, 6, 7, 0, 1, 10, 11, 12, 13, 14, 15, 8, 9);
+    uint64_t m[16];
+    __m256i a, b, c, d;
+    unsigned int r;
+
+    memcpy(m, block, sizeof(m));
+
+    a = _mm256_loadu_si256((const __m256i *)&S->h[0]);
+    b = _mm256_loadu_si256((const __m256i *)&S->h[4]);
+    c = _mm256_loadu_si256((const __m256i *)&blake2b_IV[0]);
+    d = _mm256_xor_si256(
+        _mm256_loadu_si256((const __m256i *)&blake2b_IV[4]),
+        _mm256_set_epi64x((long long)S->f[1], (long long)S->f[0],
+                          (long long)S->t[1], (long long)S->t[0]));
+
+#define MSG(s, i0, i1, i2, i3)                                                 \
+    _mm256_set_epi64x((long long)m[s[i3]], (long long)m[s[i2]],                \
+                      (long long)m[s[i1]], (long long)m[s[i0]])
+
+#define G(x, y)                                                                \
+    do {                                                                       \
+        a = _mm256_add_epi64(_mm256_add_epi64(a, b), x);                       \
+        d = _mm256_shuffle_epi32(_mm256_xor_si256(d, a),                       \
+                                 _MM_SHUFFLE(2, 3, 0, 1));                     \
+        c = _mm256_add_epi64(c, d);                                            \
+        b = _mm256_shuffle_epi8(_mm256_xor_si256(b, c), r24);                  \
+        a = _mm256_add_epi64(_mm256_add_epi64(a, b), y);                       \
+        d = _mm256_shuffle_epi8(_mm256_xor_si256(d, a), r16);                  \
+        c = _mm256_add_epi64(c, d);                                            \
+        b = _mm256_xor_si256(b, c);                                            \
+        b = _mm256_or_si256(_mm256_srli_epi64(b, 63),                          \
+                            _mm256_add_epi64(b, b));                           \
+    } while ((void)0, 0)
+
+    for (r = 0; r < 12; ++r) {
+        const unsigned int *s = blake2b_sigma[r];
+
+        /* columns */
+        G(MSG(s, 0, 2, 4, 6), MSG(s, 1, 3, 5, 7));
+        /* diagonals */
+        b = _mm256_permute4x64_epi64(b, _MM_SHUFFLE(0, 3, 2, 1));
+        c = _mm256_permute4x64_epi64(c, _MM_SHUFFLE(1, 0, 3, 2));
+        d = _mm256_permute4x64_epi64(d, _MM_SHUFFLE(2, 1, 0, 3));
+        G(MSG(s, 8, 10, 12, 14), MSG(s, 9, 11, 13, 15));
+        b = _mm256_permute4x64_epi64(b, _MM_SHUFFLE(2, 1, 0, 3));
+        c = _mm256_permute4x64_epi64(c, _MM_SHUFFLE(1, 0, 3, 2));
+        d = _mm256_permute4x64_epi64(d, _MM_SHUFFLE(0, 3, 2, 1));
+    }
+
+#undef G
+#undef MSG
+
+    a = _mm256_xor_si256(a, c);
+    b = _mm256_xor_si256(b, d);
+    _mm256_storeu_si256(
+        (__m256i *)&S->h[0],
+        _mm256_xor_si256(a, _mm256_loadu_si256((const __m256i *)&S->h[0])));
+    _mm256_storeu_si256(
+        (__m256i *)&S->h[4],
+        _mm256_xor_si256(b, _mm256_loadu_si256((const __m256i *)&S->h[4])));
+}
+
+#else /* portable */
+
 static void blake2b_compress(blake2b_state *S, const uint8_t *block) {
     uint64_t m[16];
     uint64_t v[16];
@@ -220,6 +299,8 @@ static void blake2b_compress(blake2b_state *S, const uint8_t *block) {
 #undef G
 #undef ROUND
 }
+
+#endif /* __AVX2__ */
 
 int blake2b_update(blake2b_state *S, const void *in, size_t inlen) {
     const uint8_t *pin = (const uint8_t *)in;

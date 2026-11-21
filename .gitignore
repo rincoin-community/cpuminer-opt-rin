@@ -60,3 +60,5 @@ compat/curl-for-windows/
 /test/*
 !/test/*.c
 .dirstamp
+test/rinhash_bench
+test/rinhash_bench_prof

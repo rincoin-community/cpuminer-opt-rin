@@ -189,27 +189,6 @@ void fill_segment_avx2(const argon2_instance_t *instance,
             instance->memory + instance->lane_length * ref_lane + ref_index;
         curr_block = instance->memory + curr_offset;
 
-        /* Prefetch next reference block into L2 cache */
-        if (i + 1 < instance->segment_length) {
-            uint64_t next_pseudo_rand;
-            if (data_independent_addressing) {
-                next_pseudo_rand = address_block.v[(i + 1) % ARGON2_ADDRESSES_IN_BLOCK];
-            } else {
-                next_pseudo_rand = instance->memory[curr_offset].v[0];
-            }
-            uint32_t next_ref_lane = ((next_pseudo_rand >> 32)) % instance->lanes;
-            if ((position.pass == 0) && (position.slice == 0)) {
-                next_ref_lane = position.lane;
-            }
-            argon2_position_t next_pos = position;
-            next_pos.index = i + 1;
-            uint32_t next_ref_index = index_alpha(instance, &next_pos,
-                                                  next_pseudo_rand & 0xFFFFFFFF,
-                                                  next_ref_lane == position.lane);
-            block *next_ref = instance->memory + instance->lane_length * next_ref_lane + next_ref_index;
-            _mm_prefetch((const char*)next_ref, _MM_HINT_T1);  /* L2 cache hint */
-        }
-
         /* Fill the block */
         if (ARGON2_VERSION_10 == instance->version) {
             fill_block_avx2(state, ref_block, curr_block, 0);
