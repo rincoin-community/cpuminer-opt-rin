@@ -19,7 +19,7 @@ if [ "$1" = "--tag" ]; then
 fi
 
 platform=$1
-binary=$2
+binary=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
 name=cpuminer-opt-rin-$tag-$platform
 rm -rf "$SRC/dist"
 mkdir -p "$SRC/dist/$name"
