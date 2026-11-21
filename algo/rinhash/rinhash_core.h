@@ -22,7 +22,7 @@
 #define RINHASH_BATCH 8
 #elif defined(__AVX2__)
 #define RINHASH_BATCH 4
-#elif defined(__SSE2__)
+#elif defined(__SSE2__) || defined(__ARM_NEON)
 #define RINHASH_BATCH 2
 #else
 #define RINHASH_BATCH 1

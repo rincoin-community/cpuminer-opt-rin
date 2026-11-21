@@ -15,7 +15,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <x86intrin.h>
 
 #include "../algo/rinhash/rinhash_core.h"
 #include "../algo/rinhash/blake3/blake3.h"
@@ -25,7 +24,11 @@
 static double now_cpu( void )
 {
    struct timespec ts;
+#if defined(CLOCK_THREAD_CPUTIME_ID) && !defined(_WIN32)
    clock_gettime( CLOCK_THREAD_CPUTIME_ID, &ts );
+#else
+   clock_gettime( CLOCK_MONOTONIC, &ts );
+#endif
    return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
@@ -136,10 +139,8 @@ int main( int argc, char **argv )
    memset( rinhash_prof, 0, sizeof(rinhash_prof) );
 #endif
    double m0 = now_mono(), c0 = now_cpu();
-   uint64_t r0 = __rdtsc();
    for ( int i = 0; i < n; i += RINHASH_BATCH )
       rinhash_hash_batch( ctx, 5000 + i, out );
-   uint64_t r1 = __rdtsc();
    double c1 = now_cpu(), m1 = now_mono();
 
    printf( "production path: %.2f us/hash (thread CPU time)  = %.0f H/s\n",
@@ -152,16 +153,17 @@ int main( int argc, char **argv )
          "argon2 first 2 blocks (blake2b_long x2)", "argon2 fill (126 blocks)",
          "argon2 final blake2b_long(1024->32)", "sha3-256"
       };
-      double ns_per_tick = ( m1 - m0 ) * 1e9 / (double)( r1 - r0 );
+      // The stage counters are in arbitrary ticks: scale them to the
+      // elapsed time of the loop.
       uint64_t tot = 0;
       for ( int s = 0; s < RINHASH_PROF_N; s++ ) tot += rinhash_prof[s];
       for ( int s = 0; s < RINHASH_PROF_N; s++ )
          printf( "  %-42s %7.2f us  %5.1f%%\n", name[s],
-                 rinhash_prof[s] * ns_per_tick / n / 1000.0,
+                 ( m1 - m0 ) * 1e6 / n * rinhash_prof[s] / tot,
                  100.0 * rinhash_prof[s] / tot );
    }
 #else
-   (void)m0; (void)m1; (void)r0; (void)r1;
+   (void)m0; (void)m1;
 #endif
    return 0;
 }

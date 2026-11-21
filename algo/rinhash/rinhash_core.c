@@ -29,8 +29,14 @@
 #include "argon2/blake2/blake2.h"
 #include "argon2/argon2_dispatch.h"
 
-#if RINHASH_BATCH > 1
+#if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+#if defined(_WIN32)
+#include <malloc.h>
 #endif
 
 #define RIN_MEM_BLOCKS  64
@@ -44,11 +50,21 @@
 #define likely( x )     __builtin_expect( !!(x), 1 )
 
 #ifdef RINHASH_PROFILE
-#include <x86intrin.h>
+#include <time.h>
 __thread uint64_t rinhash_prof[ RINHASH_PROF_N ];
-#define PROF_START      uint64_t prof_t = __rdtsc()
+static inline uint64_t prof_now( void )
+{
+#if defined(__x86_64__)
+   return __builtin_ia32_rdtsc();
+#else
+   struct timespec ts;
+   clock_gettime( CLOCK_MONOTONIC, &ts );
+   return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+#endif
+}
+#define PROF_START      uint64_t prof_t = prof_now()
 #define PROF( stage ) \
-   do { uint64_t t_ = __rdtsc(); rinhash_prof[ stage ] += t_ - prof_t; \
+   do { uint64_t t_ = prof_now(); rinhash_prof[ stage ] += t_ - prof_t; \
         prof_t = t_; } while (0)
 #else
 #define PROF_START      do {} while (0)
@@ -89,16 +105,37 @@ void rinhash_global_init( void )
    FLAG_clear_internal_memory = 0;
 }
 
+static void *rin_aligned_alloc( size_t align, size_t size )
+{
+#if defined(_WIN32)
+   return _aligned_malloc( size, align );
+#else
+   void *p = NULL;
+   return posix_memalign( &p, align, size ) ? NULL : p;
+#endif
+}
+
+static void rin_aligned_free( void *p )
+{
+#if defined(_WIN32)
+   _aligned_free( p );
+#else
+   free( p );
+#endif
+}
+
 rinhash_ctx_t *rinhash_ctx_new( void )
 {
    rinhash_ctx_t *ctx = NULL;
    void *mem = NULL;
    const size_t mem_size = RIN_MEM_BLOCKS * sizeof(block);
 
-   if ( posix_memalign( (void**)&ctx, 64, sizeof(*ctx) ) ) return NULL;
-   if ( posix_memalign( &mem, 4096, mem_size ) )
+   ctx = (rinhash_ctx_t*)rin_aligned_alloc( 64, sizeof(*ctx) );
+   if ( !ctx ) return NULL;
+   mem = rin_aligned_alloc( 4096, mem_size );
+   if ( !mem )
    {
-      free( ctx );
+      rin_aligned_free( ctx );
       return NULL;
    }
    // First touch by the calling thread places the pages on its NUMA node.
@@ -133,8 +170,8 @@ rinhash_ctx_t *rinhash_ctx_new( void )
 void rinhash_ctx_free( rinhash_ctx_t *ctx )
 {
    if ( !ctx ) return;
-   free( ctx->memory );
-   free( ctx );
+   rin_aligned_free( ctx->memory );
+   rin_aligned_free( ctx );
 }
 
 void rinhash_set_header( rinhash_ctx_t *ctx, const void *header )
@@ -272,23 +309,26 @@ static void rin_fill_generic( rinhash_ctx_t *ctx )
    }
 }
 
-#if defined(__AVX2__)
-
-#define RIN_FAST_FILL   "AVX2 (RinHash specific)"
-
 /*
  * Memory fill written for the RinHash geometry: Argon2d, one lane of 64
  * blocks, two passes, version 1.3.
  *
  * new block = P( prev ^ ref ) ^ prev ^ ref, in the second pass also ^ old
- * block. P is a column round over eight groups of 256-bit words followed by
- * a row round. The usual code first builds prev ^ ref in a state array and a
- * copy of it, runs the rounds on the state, then combines both. Here the
- * column rounds take prev ^ ref straight from the two blocks and the row
- * rounds write the finished words to the new block, which removes two passes
- * over the 1 KiB state.
+ * block. P applies the BlaMka round to the eight rows of the block seen as
+ * an 8 x 8 matrix of 128-bit elements, then to its eight columns. The usual
+ * code first builds prev ^ ref in a state array and a copy of it, runs the
+ * rounds on the state, then combines both. Here the first rounds take
+ * prev ^ ref straight from the two blocks and the second rounds write the
+ * finished words to the new block, which removes two passes over the 1 KiB
+ * state.
+ *
+ * A set of (a, b, c, d) rows is one dependency chain: every step needs the
+ * result of the one before it, and a multiply-add step takes six cycles.
+ * Written set after set, the later sets come more instructions later than
+ * the CPU looks ahead when two threads share the core, so they wait although
+ * they depend on nothing. Each step is therefore issued for four sets before
+ * the next step, which keeps four chains in flight.
  */
-#define RIN_LD( p, i )  _mm256_load_si256( (const __m256i*)(p) + (i) )
 
 // Index of the reference block. With a single lane the rules of the
 // Argon2 specification reduce to an area that depends only on the position:
@@ -310,62 +350,205 @@ uint32_t rin_ref_index( const uint64_t j, const uint32_t pass,
 }
 
 /*
- * BlaMka rounds over four independent sets of (a, b, c, d) rows at once.
- *
- * One set is a dependency chain: every step needs the result of the one
- * before it, and a multiply-add step takes six cycles. Written set after
- * set, as two calls of the usual two-set round, the second pair of sets
- * comes more instructions later than the CPU looks ahead when two threads
- * share the core, so it waits for the first pair although it does not
- * depend on it. Here each step is issued for all four sets before the next
- * step, which keeps four chains in flight.
+ * Vector operations of the fill, one set per instruction set. Q_MULADD is
+ * x = x + y + 2 * lo32(x) * lo32(y) in every 64-bit element.
  */
-#define RIN_ROR32( x )  _mm256_shuffle_epi32( x, _MM_SHUFFLE( 2, 3, 0, 1 ) )
-#define RIN_ROR24( x )  _mm256_shuffle_epi8( x, r24 )
-#define RIN_ROR16( x )  _mm256_shuffle_epi8( x, r16 )
-#define RIN_ROR63( x )  _mm256_xor_si256( _mm256_srli_epi64( x, 63 ), \
-                                          _mm256_add_epi64( x, x ) )
-#define RIN_SWAP64( x )  _mm256_shuffle_epi32( x, _MM_SHUFFLE( 1, 0, 3, 2 ) )
-#define RIN_SWAP128( x ) _mm256_permute2x128_si256( x, x, 1 )
+#if defined(__AVX2__)
 
-// x = x + y + 2 * lo32(x) * lo32(y)
-#define RIN_MULADD( x, y ) \
+#define RIN_FAST_FILL   "AVX2 (RinHash specific)"
+typedef __m256i qvec_t;
+#define Q_LD( p, i )    _mm256_load_si256( (const __m256i*)(p) + (i) )
+#define Q_ST( p, i, v ) _mm256_store_si256( (__m256i*)(p) + (i), v )
+#define Q_XOR( a, b )   _mm256_xor_si256( a, b )
+#define Q_MULADD( x, y ) \
 do { \
    __m256i ml_ = _mm256_mul_epu32( x, y ); \
    ml_ = _mm256_add_epi64( ml_, ml_ ); \
    x = _mm256_add_epi64( x, _mm256_add_epi64( y, ml_ ) ); \
 } while (0)
+#define Q_ROT_CONSTANTS \
+   const __m256i r24 = _mm256_setr_epi8( \
+                     3, 4, 5, 6, 7, 0, 1, 2, 11, 12, 13, 14, 15, 8, 9, 10, \
+                     3, 4, 5, 6, 7, 0, 1, 2, 11, 12, 13, 14, 15, 8, 9, 10 ); \
+   const __m256i r16 = _mm256_setr_epi8( \
+                     2, 3, 4, 5, 6, 7, 0, 1, 10, 11, 12, 13, 14, 15, 8, 9, \
+                     2, 3, 4, 5, 6, 7, 0, 1, 10, 11, 12, 13, 14, 15, 8, 9 )
+#define Q_ROR32( x )    _mm256_shuffle_epi32( x, _MM_SHUFFLE( 2, 3, 0, 1 ) )
+#define Q_ROR24( x )    _mm256_shuffle_epi8( x, r24 )
+#define Q_ROR16( x )    _mm256_shuffle_epi8( x, r16 )
+#define Q_ROR63( x )    _mm256_xor_si256( _mm256_srli_epi64( x, 63 ), \
+                                          _mm256_add_epi64( x, x ) )
+#define Q_SWAP64( x )   _mm256_shuffle_epi32( x, _MM_SHUFFLE( 1, 0, 3, 2 ) )
+#define Q_SWAP128( x )  _mm256_permute2x128_si256( x, x, 1 )
+
+#elif defined(__SSE2__)
+
+#if defined(__SSSE3__)
+#define RIN_FAST_FILL   "SSSE3 (RinHash specific)"
+#else
+#define RIN_FAST_FILL   "SSE2 (RinHash specific)"
+#endif
+typedef __m128i qvec_t;
+#define Q_LD( p, i )    _mm_load_si128( (const __m128i*)(p) + (i) )
+#define Q_ST( p, i, v ) _mm_store_si128( (__m128i*)(p) + (i), v )
+#define Q_XOR( a, b )   _mm_xor_si128( a, b )
+#define Q_MULADD( x, y ) \
+do { \
+   __m128i ml_ = _mm_mul_epu32( x, y ); \
+   ml_ = _mm_add_epi64( ml_, ml_ ); \
+   x = _mm_add_epi64( x, _mm_add_epi64( y, ml_ ) ); \
+} while (0)
+#define Q_ROR32( x )    _mm_shuffle_epi32( x, _MM_SHUFFLE( 2, 3, 0, 1 ) )
+#define Q_ROR63( x )    _mm_xor_si128( _mm_srli_epi64( x, 63 ), \
+                                       _mm_add_epi64( x, x ) )
+#if defined(__SSSE3__)
+#define Q_ROT_CONSTANTS \
+   const __m128i r24 = _mm_setr_epi8( \
+                     3, 4, 5, 6, 7, 0, 1, 2, 11, 12, 13, 14, 15, 8, 9, 10 ); \
+   const __m128i r16 = _mm_setr_epi8( \
+                     2, 3, 4, 5, 6, 7, 0, 1, 10, 11, 12, 13, 14, 15, 8, 9 )
+#define Q_ROR24( x )    _mm_shuffle_epi8( x, r24 )
+#define Q_ROR16( x )    _mm_shuffle_epi8( x, r16 )
+// [ a[1], b[0] ]
+#define Q_EXT( a, b )   _mm_alignr_epi8( b, a, 8 )
+#else
+#define Q_ROT_CONSTANTS do {} while (0)
+#define Q_ROR24( x )    _mm_or_si128( _mm_srli_epi64( x, 24 ), \
+                                      _mm_slli_epi64( x, 40 ) )
+#define Q_ROR16( x )    _mm_or_si128( _mm_srli_epi64( x, 16 ), \
+                                      _mm_slli_epi64( x, 48 ) )
+#define Q_EXT( a, b )   _mm_castpd_si128( _mm_shuffle_pd( \
+                           _mm_castsi128_pd( a ), _mm_castsi128_pd( b ), 1 ) )
+#endif
+
+#elif defined(__ARM_NEON)
+
+#define RIN_FAST_FILL   "NEON (RinHash specific)"
+typedef uint64x2_t qvec_t;
+#define Q_LD( p, i )    vld1q_u64( (const uint64_t*)(p) + 2 * (i) )
+#define Q_ST( p, i, v ) vst1q_u64( (uint64_t*)(p) + 2 * (i), v )
+#define Q_XOR( a, b )   veorq_u64( a, b )
+#define Q_MULADD( x, y ) \
+do { \
+   uint64x2_t ml_ = vmull_u32( vmovn_u64( x ), vmovn_u64( y ) ); \
+   ml_ = vaddq_u64( ml_, ml_ ); \
+   x = vaddq_u64( x, vaddq_u64( y, ml_ ) ); \
+} while (0)
+#define Q_ROT_CONSTANTS do {} while (0)
+#define Q_ROR32( x )    vreinterpretq_u64_u32( vrev64q_u32( \
+                           vreinterpretq_u32_u64( x ) ) )
+#define Q_ROR24( x )    vsriq_n_u64( vshlq_n_u64( x, 40 ), x, 24 )
+#define Q_ROR16( x )    vsriq_n_u64( vshlq_n_u64( x, 48 ), x, 16 )
+#define Q_ROR63( x )    vsriq_n_u64( vaddq_u64( x, x ), x, 63 )
+// [ a[1], b[0] ]
+#define Q_EXT( a, b )   vextq_u64( a, b, 1 )
+
+#endif
+
+#ifdef RIN_FAST_FILL
 
 #define RIN_STEP4( X0, Y0, X1, Y1, X2, Y2, X3, Y3, Z0, Z1, Z2, Z3, ROR ) \
 do { \
-   RIN_MULADD( X0, Y0 );  RIN_MULADD( X1, Y1 ); \
-   RIN_MULADD( X2, Y2 );  RIN_MULADD( X3, Y3 ); \
-   Z0 = ROR( _mm256_xor_si256( Z0, X0 ) ); \
-   Z1 = ROR( _mm256_xor_si256( Z1, X1 ) ); \
-   Z2 = ROR( _mm256_xor_si256( Z2, X2 ) ); \
-   Z3 = ROR( _mm256_xor_si256( Z3, X3 ) ); \
+   Q_MULADD( X0, Y0 );  Q_MULADD( X1, Y1 ); \
+   Q_MULADD( X2, Y2 );  Q_MULADD( X3, Y3 ); \
+   Z0 = ROR( Q_XOR( Z0, X0 ) ); \
+   Z1 = ROR( Q_XOR( Z1, X1 ) ); \
+   Z2 = ROR( Q_XOR( Z2, X2 ) ); \
+   Z3 = ROR( Q_XOR( Z3, X3 ) ); \
 } while (0)
 
+// The four G steps over four independent sets of rows.
 #define RIN_G4( A0, B0, C0, D0, A1, B1, C1, D1, \
                 A2, B2, C2, D2, A3, B3, C3, D3 ) \
 do { \
-   RIN_STEP4( A0, B0, A1, B1, A2, B2, A3, B3, D0, D1, D2, D3, RIN_ROR32 ); \
-   RIN_STEP4( C0, D0, C1, D1, C2, D2, C3, D3, B0, B1, B2, B3, RIN_ROR24 ); \
-   RIN_STEP4( A0, B0, A1, B1, A2, B2, A3, B3, D0, D1, D2, D3, RIN_ROR16 ); \
-   RIN_STEP4( C0, D0, C1, D1, C2, D2, C3, D3, B0, B1, B2, B3, RIN_ROR63 ); \
+   RIN_STEP4( A0, B0, A1, B1, A2, B2, A3, B3, D0, D1, D2, D3, Q_ROR32 ); \
+   RIN_STEP4( C0, D0, C1, D1, C2, D2, C3, D3, B0, B1, B2, B3, Q_ROR24 ); \
+   RIN_STEP4( A0, B0, A1, B1, A2, B2, A3, B3, D0, D1, D2, D3, Q_ROR16 ); \
+   RIN_STEP4( C0, D0, C1, D1, C2, D2, C3, D3, B0, B1, B2, B3, Q_ROR63 ); \
 } while (0)
 
-// Column round: a set is one 16-word group, each row in one register. The
-// diagonals come from rotating rows b, c and d by one, two and three words.
+/*
+ * A BlaMka round over two 16-word groups whose rows are split over a pair
+ * of sets: sets 0 and 1 hold one or two groups, sets 2 and 3 likewise. With
+ * 256-bit registers each set carries half a row of two groups, with 128-bit
+ * registers half a row of one group. Moving b, c and d to the diagonals
+ * exchanges words between the two sets of a pair.
+ */
+#if defined(__AVX2__)
+
+#define RIN_PAIR_DIAG( B0, C0, D0, B1, C1, D1 ) \
+do { \
+   __m256i t1_ = _mm256_blend_epi32( B0, B1, 0xCC ); \
+   __m256i t2_ = _mm256_blend_epi32( B0, B1, 0x33 ); \
+   B1 = Q_SWAP64( t1_ );  B0 = Q_SWAP64( t2_ ); \
+   t1_ = C0;  C0 = C1;  C1 = t1_; \
+   t1_ = _mm256_blend_epi32( D0, D1, 0xCC ); \
+   t2_ = _mm256_blend_epi32( D0, D1, 0x33 ); \
+   D0 = Q_SWAP64( t1_ );  D1 = Q_SWAP64( t2_ ); \
+} while (0)
+
+#define RIN_PAIR_UNDIAG( B0, C0, D0, B1, C1, D1 ) \
+do { \
+   __m256i t1_ = _mm256_blend_epi32( B0, B1, 0xCC ); \
+   __m256i t2_ = _mm256_blend_epi32( B0, B1, 0x33 ); \
+   B0 = Q_SWAP64( t1_ );  B1 = Q_SWAP64( t2_ ); \
+   t1_ = C0;  C0 = C1;  C1 = t1_; \
+   t1_ = _mm256_blend_epi32( D0, D1, 0x33 ); \
+   t2_ = _mm256_blend_epi32( D0, D1, 0xCC ); \
+   D0 = Q_SWAP64( t1_ );  D1 = Q_SWAP64( t2_ ); \
+} while (0)
+
+#else
+
+#define RIN_PAIR_DIAG( B0, C0, D0, B1, C1, D1 ) \
+do { \
+   qvec_t t1_ = Q_EXT( B0, B1 ); \
+   qvec_t t2_ = Q_EXT( B1, B0 ); \
+   B0 = t1_;  B1 = t2_; \
+   t1_ = C0;  C0 = C1;  C1 = t1_; \
+   t1_ = Q_EXT( D1, D0 ); \
+   t2_ = Q_EXT( D0, D1 ); \
+   D0 = t1_;  D1 = t2_; \
+} while (0)
+
+#define RIN_PAIR_UNDIAG( B0, C0, D0, B1, C1, D1 ) \
+do { \
+   qvec_t t1_ = Q_EXT( B1, B0 ); \
+   qvec_t t2_ = Q_EXT( B0, B1 ); \
+   B0 = t1_;  B1 = t2_; \
+   t1_ = C0;  C0 = C1;  C1 = t1_; \
+   t1_ = Q_EXT( D0, D1 ); \
+   t2_ = Q_EXT( D1, D0 ); \
+   D0 = t1_;  D1 = t2_; \
+} while (0)
+
+#endif
+
+#define RIN_ROUND_PAIRS( A0, B0, C0, D0, A1, B1, C1, D1, \
+                         A2, B2, C2, D2, A3, B3, C3, D3 ) \
+do { \
+   RIN_G4( A0, B0, C0, D0, A1, B1, C1, D1, A2, B2, C2, D2, A3, B3, C3, D3 ); \
+   RIN_PAIR_DIAG( B0, C0, D0, B1, C1, D1 ); \
+   RIN_PAIR_DIAG( B2, C2, D2, B3, C3, D3 ); \
+   RIN_G4( A0, B0, C0, D0, A1, B1, C1, D1, A2, B2, C2, D2, A3, B3, C3, D3 ); \
+   RIN_PAIR_UNDIAG( B0, C0, D0, B1, C1, D1 ); \
+   RIN_PAIR_UNDIAG( B2, C2, D2, B3, C3, D3 ); \
+} while (0)
+
+#if defined(__AVX2__)
+
+// With 256-bit registers a row of one 16-word group fills a register, so
+// in the first rounds a set is a whole group and the diagonals come from
+// rotating rows b, c and d by one, two and three words.
 #define RIN_ROWS_ROT( B, C, D, IB, ID ) \
 do { \
    B = _mm256_permute4x64_epi64( B, IB ); \
-   C = RIN_SWAP128( C ); \
+   C = Q_SWAP128( C ); \
    D = _mm256_permute4x64_epi64( D, ID ); \
 } while (0)
 
-#define RIN_ROUND_COLS( A0, B0, C0, D0, A1, B1, C1, D1, \
-                        A2, B2, C2, D2, A3, B3, C3, D3 ) \
+#define RIN_ROUND_GROUPS( A0, B0, C0, D0, A1, B1, C1, D1, \
+                          A2, B2, C2, D2, A3, B3, C3, D3 ) \
 do { \
    RIN_G4( A0, B0, C0, D0, A1, B1, C1, D1, A2, B2, C2, D2, A3, B3, C3, D3 ); \
    RIN_ROWS_ROT( B0, C0, D0, _MM_SHUFFLE( 0, 3, 2, 1 ), _MM_SHUFFLE( 2, 1, 0, 3 ) ); \
@@ -379,74 +562,53 @@ do { \
    RIN_ROWS_ROT( B3, C3, D3, _MM_SHUFFLE( 2, 1, 0, 3 ), _MM_SHUFFLE( 0, 3, 2, 1 ) ); \
 } while (0)
 
-// Row round: two sets share their rows, half a row of each per 128-bit
-// half of a register. Sets 0 and 1 are one such pair, sets 2 and 3 another.
-#define RIN_PAIR_DIAG( B0, C0, D0, B1, C1, D1 ) \
-do { \
-   __m256i t1_ = _mm256_blend_epi32( B0, B1, 0xCC ); \
-   __m256i t2_ = _mm256_blend_epi32( B0, B1, 0x33 ); \
-   B1 = RIN_SWAP64( t1_ );  B0 = RIN_SWAP64( t2_ ); \
-   t1_ = C0;  C0 = C1;  C1 = t1_; \
-   t1_ = _mm256_blend_epi32( D0, D1, 0xCC ); \
-   t2_ = _mm256_blend_epi32( D0, D1, 0x33 ); \
-   D0 = RIN_SWAP64( t1_ );  D1 = RIN_SWAP64( t2_ ); \
-} while (0)
+// Registers per block and per 16-word group
+#define RIN_QN    32
+#define RIN_QG    4
 
-#define RIN_PAIR_UNDIAG( B0, C0, D0, B1, C1, D1 ) \
-do { \
-   __m256i t1_ = _mm256_blend_epi32( B0, B1, 0xCC ); \
-   __m256i t2_ = _mm256_blend_epi32( B0, B1, 0x33 ); \
-   B0 = RIN_SWAP64( t1_ );  B1 = RIN_SWAP64( t2_ ); \
-   t1_ = C0;  C0 = C1;  C1 = t1_; \
-   t1_ = _mm256_blend_epi32( D0, D1, 0x33 ); \
-   t2_ = _mm256_blend_epi32( D0, D1, 0xCC ); \
-   D0 = RIN_SWAP64( t1_ );  D1 = RIN_SWAP64( t2_ ); \
-} while (0)
+#else
 
-#define RIN_ROUND_ROWS( A0, B0, C0, D0, A1, B1, C1, D1, \
-                        A2, B2, C2, D2, A3, B3, C3, D3 ) \
-do { \
-   RIN_G4( A0, B0, C0, D0, A1, B1, C1, D1, A2, B2, C2, D2, A3, B3, C3, D3 ); \
-   RIN_PAIR_DIAG( B0, C0, D0, B1, C1, D1 ); \
-   RIN_PAIR_DIAG( B2, C2, D2, B3, C3, D3 ); \
-   RIN_G4( A0, B0, C0, D0, A1, B1, C1, D1, A2, B2, C2, D2, A3, B3, C3, D3 ); \
-   RIN_PAIR_UNDIAG( B0, C0, D0, B1, C1, D1 ); \
-   RIN_PAIR_UNDIAG( B2, C2, D2, B3, C3, D3 ); \
-} while (0)
+#define RIN_QN    64
+#define RIN_QG    8
+
+#endif
 
 // pos = pass * 64 + slice * 16 + index of the block being written.
 static inline __attribute__ ((always_inline))
 void rin_fill_block( block *mem, const uint32_t pos )
 {
-   const __m256i r24 = _mm256_setr_epi8(
-                     3, 4, 5, 6, 7, 0, 1, 2, 11, 12, 13, 14, 15, 8, 9, 10,
-                     3, 4, 5, 6, 7, 0, 1, 2, 11, 12, 13, 14, 15, 8, 9, 10 );
-   const __m256i r16 = _mm256_setr_epi8(
-                     2, 3, 4, 5, 6, 7, 0, 1, 10, 11, 12, 13, 14, 15, 8, 9,
-                     2, 3, 4, 5, 6, 7, 0, 1, 10, 11, 12, 13, 14, 15, 8, 9 );
+   Q_ROT_CONSTANTS;
    const uint32_t pass = pos >> 6, slice = ( pos >> 4 ) & 3, index = pos & 15;
    const uint32_t curr = pos & ( RIN_MEM_BLOCKS - 1 );
    const uint64_t *prev = mem[ ( curr - 1 ) & ( RIN_MEM_BLOCKS - 1 ) ].v;
    const uint64_t *ref = mem[ rin_ref_index( prev[0], pass, slice, index ) ].v;
    uint64_t *next = mem[ curr ].v;
    const int with_xor = pass;
-   __m256i t[32];
+   qvec_t t[ RIN_QN ];
 
-#define RIN_IN( k )  _mm256_xor_si256( RIN_LD( prev, k ), RIN_LD( ref, k ) )
+#define RIN_IN( k )  Q_XOR( Q_LD( prev, k ), Q_LD( ref, k ) )
 
-   // Column rounds: the eight 16-word groups, four at a time.
-   for ( int i = 0; i < 32; i += 16 )
+   // First rounds: the eight 16-word groups of the block, sixteen registers
+   // at a time.
+   for ( int i = 0; i < RIN_QN; i += 16 )
    {
-      __m256i x0  = RIN_IN( i+0  ), x1  = RIN_IN( i+1  );
-      __m256i x2  = RIN_IN( i+2  ), x3  = RIN_IN( i+3  );
-      __m256i x4  = RIN_IN( i+4  ), x5  = RIN_IN( i+5  );
-      __m256i x6  = RIN_IN( i+6  ), x7  = RIN_IN( i+7  );
-      __m256i x8  = RIN_IN( i+8  ), x9  = RIN_IN( i+9  );
-      __m256i x10 = RIN_IN( i+10 ), x11 = RIN_IN( i+11 );
-      __m256i x12 = RIN_IN( i+12 ), x13 = RIN_IN( i+13 );
-      __m256i x14 = RIN_IN( i+14 ), x15 = RIN_IN( i+15 );
-      RIN_ROUND_COLS( x0, x1, x2,  x3,  x4,  x5,  x6,  x7,
-                      x8, x9, x10, x11, x12, x13, x14, x15 );
+      qvec_t x0  = RIN_IN( i+0  ), x1  = RIN_IN( i+1  );
+      qvec_t x2  = RIN_IN( i+2  ), x3  = RIN_IN( i+3  );
+      qvec_t x4  = RIN_IN( i+4  ), x5  = RIN_IN( i+5  );
+      qvec_t x6  = RIN_IN( i+6  ), x7  = RIN_IN( i+7  );
+      qvec_t x8  = RIN_IN( i+8  ), x9  = RIN_IN( i+9  );
+      qvec_t x10 = RIN_IN( i+10 ), x11 = RIN_IN( i+11 );
+      qvec_t x12 = RIN_IN( i+12 ), x13 = RIN_IN( i+13 );
+      qvec_t x14 = RIN_IN( i+14 ), x15 = RIN_IN( i+15 );
+#if RIN_QG == 4
+      // four groups, rows a b c d in consecutive registers
+      RIN_ROUND_GROUPS( x0, x1, x2,  x3,  x4,  x5,  x6,  x7,
+                        x8, x9, x10, x11, x12, x13, x14, x15 );
+#else
+      // two groups, each row in two consecutive registers
+      RIN_ROUND_PAIRS( x0, x2,  x4,  x6,  x1, x3,  x5,  x7,
+                       x8, x10, x12, x14, x9, x11, x13, x15 );
+#endif
       t[i+0]  = x0;   t[i+1]  = x1;   t[i+2]  = x2;   t[i+3]  = x3;
       t[i+4]  = x4;   t[i+5]  = x5;   t[i+6]  = x6;   t[i+7]  = x7;
       t[i+8]  = x8;   t[i+9]  = x9;   t[i+10] = x10;  t[i+11] = x11;
@@ -455,29 +617,30 @@ void rin_fill_block( block *mem, const uint32_t pos )
 
 #define RIN_OUT( a, k ) \
    do { \
-      __m256i x_ = _mm256_xor_si256( a, RIN_IN( k ) ); \
-      if ( with_xor ) x_ = _mm256_xor_si256( x_, RIN_LD( next, k ) ); \
-      _mm256_store_si256( (__m256i*)next + (k), x_ ); \
+      qvec_t x_ = Q_XOR( a, RIN_IN( k ) ); \
+      if ( with_xor ) x_ = Q_XOR( x_, Q_LD( next, k ) ); \
+      Q_ST( next, k, x_ ); \
    } while (0)
 
-   // Row rounds: registers i, 4+i, ... 28+i hold two interleaved 16-word
-   // groups; i and i+1 together are four sets.
-   for ( int i = 0; i < 4; i += 2 )
+   // Second rounds: registers i, G+i, 2G+i ... 7G+i hold the groups made of
+   // the columns; i and i+1 together are sixteen registers.
+   for ( int i = 0; i < RIN_QG; i += 2 )
    {
-      __m256i a0 = t[i],     a1 = t[4+i],  b0 = t[8+i],  b1 = t[12+i];
-      __m256i c0 = t[16+i],  c1 = t[20+i], d0 = t[24+i], d1 = t[28+i];
-      __m256i a2 = t[i+1],   a3 = t[5+i],  b2 = t[9+i],  b3 = t[13+i];
-      __m256i c2 = t[17+i],  c3 = t[21+i], d2 = t[25+i], d3 = t[29+i];
-      RIN_ROUND_ROWS( a0, b0, c0, d0, a1, b1, c1, d1,
-                      a2, b2, c2, d2, a3, b3, c3, d3 );
-      RIN_OUT( a0, i );       RIN_OUT( a1, 4+i );
-      RIN_OUT( b0, 8+i );     RIN_OUT( b1, 12+i );
-      RIN_OUT( c0, 16+i );    RIN_OUT( c1, 20+i );
-      RIN_OUT( d0, 24+i );    RIN_OUT( d1, 28+i );
-      RIN_OUT( a2, i+1 );     RIN_OUT( a3, 5+i );
-      RIN_OUT( b2, 9+i );     RIN_OUT( b3, 13+i );
-      RIN_OUT( c2, 17+i );    RIN_OUT( c3, 21+i );
-      RIN_OUT( d2, 25+i );    RIN_OUT( d3, 29+i );
+      const int g = RIN_QG;
+      qvec_t a0 = t[i],         a1 = t[g+i],     b0 = t[2*g+i],   b1 = t[3*g+i];
+      qvec_t c0 = t[4*g+i],     c1 = t[5*g+i],   d0 = t[6*g+i],   d1 = t[7*g+i];
+      qvec_t a2 = t[i+1],       a3 = t[g+i+1],   b2 = t[2*g+i+1], b3 = t[3*g+i+1];
+      qvec_t c2 = t[4*g+i+1],   c3 = t[5*g+i+1], d2 = t[6*g+i+1], d3 = t[7*g+i+1];
+      RIN_ROUND_PAIRS( a0, b0, c0, d0, a1, b1, c1, d1,
+                       a2, b2, c2, d2, a3, b3, c3, d3 );
+      RIN_OUT( a0, i );           RIN_OUT( a1, g+i );
+      RIN_OUT( b0, 2*g+i );       RIN_OUT( b1, 3*g+i );
+      RIN_OUT( c0, 4*g+i );       RIN_OUT( c1, 5*g+i );
+      RIN_OUT( d0, 6*g+i );       RIN_OUT( d1, 7*g+i );
+      RIN_OUT( a2, i+1 );         RIN_OUT( a3, g+i+1 );
+      RIN_OUT( b2, 2*g+i+1 );     RIN_OUT( b3, 3*g+i+1 );
+      RIN_OUT( c2, 4*g+i+1 );     RIN_OUT( c3, 5*g+i+1 );
+      RIN_OUT( d2, 6*g+i+1 );     RIN_OUT( d3, 7*g+i+1 );
    }
 #undef RIN_OUT
 #undef RIN_IN
@@ -490,7 +653,7 @@ static void rin_fill_fast( block *mem )
       rin_fill_block( mem, pos );
 }
 
-#endif // AVX2
+#endif // RIN_FAST_FILL
 
 // Cleared by the self test if the RinHash specific fill gives a wrong result.
 static int rin_use_fast_fill = 1;
@@ -647,6 +810,27 @@ typedef __m256i vec_t;
                               2, 3, 4, 5, 6, 7, 0, 1, 10, 11, 12, 13, 14, 15, 8, 9 ) )
 #define V_ROR63( a )       V_OR( V_SRLI( a, 63 ), V_ADD( a, a ) )
 #define V_NAME             "4-way AVX2"
+
+#elif defined(__ARM_NEON)
+
+typedef uint64x2_t vec_t;
+#define V_ADD( a, b )      vaddq_u64( a, b )
+#define V_XOR( a, b )      veorq_u64( a, b )
+#define V_OR( a, b )       vorrq_u64( a, b )
+#define V_ANDN( a, b )     vbicq_u64( b, a )
+#define V_SET1( x )        vdupq_n_u64( (uint64_t)(x) )
+#define V_ZERO             vdupq_n_u64( 0 )
+#define V_LOAD( p )        vld1q_u64( (const uint64_t*)(p) )
+#define V_STORE( p, v )    vst1q_u64( (uint64_t*)(p), v )
+#define V_SLLI( a, n )     vshlq_n_u64( a, n )
+#define V_SRLI( a, n )     vshrq_n_u64( a, n )
+#define V_ROL( a, n )      vsriq_n_u64( vshlq_n_u64( a, n ), a, 64 - (n) )
+#define V_ROR32( a )       vreinterpretq_u64_u32( vrev64q_u32( \
+                              vreinterpretq_u32_u64( a ) ) )
+#define V_ROR24( a )       V_ROL( a, 40 )
+#define V_ROR16( a )       V_ROL( a, 48 )
+#define V_ROR63( a )       vsriq_n_u64( vaddq_u64( a, a ), a, 63 )
+#define V_NAME             "2-way NEON"
 
 #else
 
