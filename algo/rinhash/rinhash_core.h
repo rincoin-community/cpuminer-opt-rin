@@ -15,7 +15,7 @@
 #include <stddef.h>
 
 /* Number of consecutive nonces hashed by one rinhash_hash_batch call. */
-#if defined(__AVX512F__) && defined(__AVX512VL__) && defined(__AVX512BW__)
+#if defined(__AVX512F__)
 #define RINHASH_BATCH 8
 #elif defined(__AVX2__)
 #define RINHASH_BATCH 4

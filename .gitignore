@@ -59,6 +59,5 @@ compat/curl-for-windows/
 /release/
 /test/*
 !/test/*.c
+!/test/*.sh
 .dirstamp
-test/rinhash_bench
-test/rinhash_bench_prof
