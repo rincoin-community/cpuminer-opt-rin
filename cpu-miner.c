@@ -1334,8 +1334,18 @@ static int share_result( int result, struct work *work,
    return 1;
 }
 
+/*
+ * Stratum submit request template with incremental ID
+ * 
+ * BUG FIX: Changed from hardcoded "id":4 to incremental ID.
+ * Some pools expect unique JSON-RPC IDs for each request and may reject
+ * or mishandle responses when IDs are reused.
+ */
 static const char *json_submit_req =
-   "{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":4}";
+   "{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":%d}";
+
+/* Counter for stratum submit request IDs (starts at 4 to continue after subscribe/authorize/extranonce) */
+static int stratum_submit_id = 4;
 
 void std_le_build_stratum_request( char *req, struct work *work )
 {
@@ -1348,7 +1358,7 @@ void std_le_build_stratum_request( char *req, struct work *work )
    bin2hex( noncestr, (char*)(&nonce), sizeof(uint32_t) );
    xnonce2str = abin2hex( work->xnonce2, work->xnonce2_len );
    snprintf( req, JSON_BUF_LEN, json_submit_req, rpc_user, work->job_id,
-             xnonce2str, ntimestr, noncestr );
+             xnonce2str, ntimestr, noncestr, stratum_submit_id++ );
    free( xnonce2str );
 }
 
@@ -1364,7 +1374,7 @@ void std_be_build_stratum_request( char *req, struct work *work )
    bin2hex( noncestr, (char*)(&nonce), sizeof(uint32_t) );
    xnonce2str = abin2hex( work->xnonce2, work->xnonce2_len );
    snprintf( req, JSON_BUF_LEN, json_submit_req, rpc_user, work->job_id,
-             xnonce2str, ntimestr, noncestr );
+             xnonce2str, ntimestr, noncestr, stratum_submit_id++ );
    free( xnonce2str );
 }
 
@@ -1889,11 +1899,22 @@ static void update_submit_stats( struct work *work, const void *hash )
 bool submit_solution( struct work *work, const void *hash,
                       struct thr_info *thr )
 {
-// Job went stale during hashing of a valid share.
-//   if ( !opt_quiet && work_restart[ thr->id ].restart )
-//      applog( LOG_INFO, CL_LBL "Share may be stale, submitting anyway..." CL_N );
-   
    work->sharediff = hash_to_diff( hash );
+   
+   // Check if work has been superseded by a new job (stale work check)
+   pthread_rwlock_rdlock( &g_work_lock );
+   bool is_stale = ( work->job_id && g_work.job_id && 
+                     strcmp( work->job_id, g_work.job_id ) != 0 );
+   pthread_rwlock_unlock( &g_work_lock );
+   
+   if ( unlikely( is_stale ) )
+   {
+      if ( opt_debug )
+         applog( LOG_INFO, "Share discarded: stale job (work=%s current=%s)",
+                 work->job_id, g_work.job_id );
+      return false;
+   }
+   
    if ( likely( submit_work( thr, work ) ) )
    {
      update_submit_stats( work, hash );
@@ -1994,24 +2015,29 @@ static bool wanna_mine(int thr_id)
 
 // Common target functions, default usually listed first.
 
+#include "algo/sha/sph_sha2.h"
+
 // default, double sha256 for root hash
 void sha256d_gen_merkle_root( char* merkle_root, struct stratum_ctx* sctx )
 {
-  sha256d( merkle_root, sctx->job.coinbase, (int) sctx->job.coinbase_size );
+  sph_sha256_full( merkle_root, sctx->job.coinbase, (int) sctx->job.coinbase_size );
+  sph_sha256_full( merkle_root, merkle_root, 32 );
   for ( int i = 0; i < sctx->job.merkle_count; i++ )
   {
      memcpy( merkle_root + 32, sctx->job.merkle[i], 32 );
-     sha256d( merkle_root, merkle_root, 64 );
+     sph_sha256_full( merkle_root, merkle_root, 64 );
+     sph_sha256_full( merkle_root, merkle_root, 32 );
   }
 }
 // single sha256 root hash
 void sha256_gen_merkle_root( char* merkle_root, struct stratum_ctx* sctx )
 {
-  sha256_full( merkle_root, sctx->job.coinbase, (int)sctx->job.coinbase_size );
+  sph_sha256_full( merkle_root, sctx->job.coinbase, (int)sctx->job.coinbase_size );
   for ( int i = 0; i < sctx->job.merkle_count; i++ )
   {
      memcpy( merkle_root + 32, sctx->job.merkle[i], 32 );
-     sha256d( merkle_root, merkle_root, 64 );
+       sph_sha256_full( merkle_root, merkle_root, 64 );
+       sph_sha256_full( merkle_root, merkle_root, 32 );
   }
 }
 
@@ -2061,9 +2087,12 @@ static void stratum_gen_work( struct stratum_ctx *sctx, struct work *g_work )
    g_work->xnonce2_len = sctx->xnonce2_size;
    g_work->xnonce2 = (uchar*) realloc( g_work->xnonce2, sctx->xnonce2_size );
    memcpy( g_work->xnonce2, sctx->job.xnonce2, sctx->xnonce2_size );
+
    algo_gate.build_extraheader( g_work, sctx );
+
    net_diff = nbits_to_diff( g_work->data[ algo_gate.nbits_index ] );
    algo_gate.set_work_data_endian( g_work );
+
    g_work->height = sctx->block_height;
    g_work->targetdiff = sctx->job.diff
                            / ( opt_target_factor * opt_diff_factor );
@@ -2080,6 +2109,9 @@ static void stratum_gen_work( struct stratum_ctx *sctx, struct work *g_work )
 
    pthread_mutex_unlock( &sctx->work_lock );
    pthread_rwlock_unlock( &g_work_lock );
+
+   if ( opt_debug )
+      applog( LOG_DEBUG, "stratum_gen_work: locks released" );
 
    pthread_mutex_lock( &stats_lock );
 
@@ -2465,8 +2497,6 @@ void restart_threads(void)
 {
 	for ( int i = 0; i < opt_n_threads; i++)
 		work_restart[i].restart = 1;
-   if ( opt_debug )
-      applog( LOG_INFO, "Threads restarted for new work."); 
 }
 
 json_t *std_longpoll_rpc_call( CURL *curl, int *err, char* lp_url )
@@ -2708,6 +2738,7 @@ void std_build_extraheader( struct work* g_work, struct stratum_ctx* sctx )
    uchar merkle_tree[64] = { 0 };
 
    algo_gate.gen_merkle_root( merkle_tree, sctx );
+
    algo_gate.build_block_header( g_work, le32dec(sctx->job.version),
           (uint32_t*) sctx->job.prevhash, (uint32_t*) merkle_tree,
           swab32(le32dec(sctx->job.ntime)), swab32(le32dec(sctx->job.nbits)),
@@ -2789,8 +2820,8 @@ static void *stratum_thread(void *userdata )
             applog(LOG_BLUE,"Stratum connection established" );
             if ( stratum.new_job )   // prime first job
             {
-               stratum_down = false;
                stratum_gen_work( &stratum, &g_work );
+               stratum_down = false;
             }
          }
       }
@@ -2800,7 +2831,6 @@ static void *stratum_thread(void *userdata )
       {
          if ( likely( s = stratum_recv_line( &stratum ) ) )
          {
-            stratum_down = false;
             if ( likely( !stratum_handle_method( &stratum, s ) ) )
                stratum_handle_response( s );
             free( s );
@@ -2863,7 +2893,10 @@ static void *stratum_thread(void *userdata )
          } // stratum_keepalive
 
          if ( stratum.new_job && !stratum_need_reset )
+         {
             stratum_gen_work( &stratum, &g_work );
+            stratum_down = false;
+         }
 
       } // stratum_need_reset
    }  // loop
