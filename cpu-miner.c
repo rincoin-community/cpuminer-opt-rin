@@ -1902,16 +1902,23 @@ bool submit_solution( struct work *work, const void *hash,
    work->sharediff = hash_to_diff( hash );
    
    // Check if work has been superseded by a new job (stale work check)
+   char *current_job_id = NULL;
    pthread_rwlock_rdlock( &g_work_lock );
    bool is_stale = ( work->job_id && g_work.job_id && 
                      strcmp( work->job_id, g_work.job_id ) != 0 );
+   // g_work.job_id may be replaced as soon as the lock is released.
+   if ( unlikely( is_stale && opt_debug ) )
+      current_job_id = strdup( g_work.job_id );
    pthread_rwlock_unlock( &g_work_lock );
    
    if ( unlikely( is_stale ) )
    {
-      if ( opt_debug )
+      if ( current_job_id )
+      {
          applog( LOG_INFO, "Share discarded: stale job (work=%s current=%s)",
-                 work->job_id, g_work.job_id );
+                 work->job_id, current_job_id );
+         free( current_job_id );
+      }
       return false;
    }
    

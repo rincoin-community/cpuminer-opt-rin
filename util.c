@@ -1677,6 +1677,13 @@ void stratum_disconnect(struct stratum_ctx *sctx)
 		sctx->sockbuf[0] = '\0';
 	}
 	pthread_mutex_unlock(&sctx->sock_lock);
+
+	/* Forget the job of this connection, the pool will not accept shares
+	   for it on the next one. */
+	pthread_mutex_lock(&sctx->work_lock);
+	sctx->new_job = false;
+	sctx->have_job = false;
+	pthread_mutex_unlock(&sctx->work_lock);
 }
 
 static const char *get_stratum_session_id(json_t *val)
@@ -2131,6 +2138,7 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 	hex2bin( sctx->job.ntime, stime, 4 );
 	sctx->job.clean = clean;
 	sctx->job.diff = sctx->next_diff;
+	sctx->have_job = true;
 
 	pthread_mutex_unlock( &sctx->work_lock );
 
@@ -2161,10 +2169,12 @@ static bool stratum_set_difficulty(struct stratum_ctx *sctx, json_t *params)
 	 * However, some pools send mining.set_difficulty before the first
 	 * mining.notify. In that case we must not force a work rebuild yet,
 	 * because the job fields are still incomplete and generating work from
-	 * them can crash the miner on startup.
+	 * them can crash the miner on startup. The same holds after a reconnect:
+	 * the job fields are complete then, but they belong to the previous
+	 * connection and the pool rejects shares for that job.
 	 */
 	sctx->job.diff = diff;
-	if (sctx->job.job_id)
+	if (sctx->have_job)
 		sctx->new_job = true;  /* Signal work regeneration with new target */
 	else if (opt_debug)
 		applog(LOG_DEBUG, "Stratum difficulty %g received before first job", diff);

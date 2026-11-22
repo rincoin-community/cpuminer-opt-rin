@@ -504,6 +504,9 @@ struct stratum_ctx {
 
    int block_height;
    bool new_job;  
+   // A job has been received on the current connection. Cleared when the
+   // connection is closed: the job of an earlier connection is of no use.
+   bool have_job;
 } __attribute__ ((aligned (64)));
 
 bool stratum_socket_full(struct stratum_ctx *sctx, int timeout);
